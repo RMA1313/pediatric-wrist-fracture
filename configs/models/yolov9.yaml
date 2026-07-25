@@ -1,0 +1,6 @@
+model:
+  name: yolov9
+  task: detect
+  pretrained: true
+  implementation_status: unresolved
+

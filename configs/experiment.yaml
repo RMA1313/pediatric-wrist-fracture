@@ -1,0 +1,11 @@
+experiment:
+  model: yolo26
+  checkpoint: null
+  image_size: 640
+  batch_size: 16
+  epochs: 100
+  device: auto
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+

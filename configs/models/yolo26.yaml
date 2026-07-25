@@ -1,0 +1,5 @@
+model:
+  name: yolo26
+  task: detect
+  pretrained: true
+
