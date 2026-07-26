@@ -3,18 +3,47 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
-from scripts.prepare_dataset import validate_split
+from scripts.prepare_dataset import build_records, validate_split
 
 from wrist_fracture.data.preparation import (
     AnnotationBox,
     ImageRecord,
     build_patient_split,
+    json_ready,
     parse_pascalvoc,
     parse_supervisely,
-    json_ready,
     save_json,
 )
+
+
+def _write_synthetic_dataset(root: Path, count: int = 6) -> Path:
+    raw = root / "data" / "raw"
+    extracted = raw / "extracted" / "set1"
+    archives = raw / "archives"
+    extracted.mkdir(parents=True, exist_ok=True)
+    archives.mkdir(parents=True, exist_ok=True)
+    rows = ["filestem,patient_id,study_id"]
+    for idx in range(count):
+        stem = f"case_{idx:02d}"
+        img = np.full((32, 32), idx + 1, dtype=np.uint8)
+        cv2.imwrite(str(extracted / f"{stem}.png"), img)
+        xml = extracted / f"{stem}.xml"
+        xml.write_text(
+            f"<annotation><filename>{stem}.png</filename><size><width>32</width><height>32</height></size><object><name>fracture</name><bndbox><xmin>1</xmin><ymin>2</ymin><xmax>10</xmax><ymax>12</ymax></bndbox></object></annotation>",
+            encoding="utf-8",
+        )
+        js = extracted / f"{stem}.json"
+        js.write_text(
+            '{"size":{"width":32,"height":32},"objects":[{"classTitle":"fracture","points":{"exterior":[[1,2],[10,12]]}}]}',
+            encoding="utf-8",
+        )
+        rows.append(f"{stem},{idx // 2},{idx}")
+    (archives / "dataset.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    (archives / "folder_structure.zip").write_text("", encoding="utf-8")
+    return raw
 
 
 def test_parse_pascalvoc(tmp_path: Path):
@@ -108,3 +137,34 @@ def test_save_json_handles_paths(tmp_path: Path):
     save_json(output, {"path": Path("data") / "nested" / "file.txt"})
     data = json.loads(output.read_text(encoding="utf-8"))
     assert data["path"] == "data/nested/file.txt"
+
+
+def test_inspect_serial_parallel_equivalence(tmp_path: Path):
+    raw = _write_synthetic_dataset(tmp_path, count=6)
+    serial_records, serial_summary = build_records(raw, workers=1, batch_size=2, progress=False)
+    parallel_records, parallel_summary = build_records(raw, workers=2, batch_size=2, progress=False)
+    assert [r.stem for r in serial_records] == [r.stem for r in parallel_records]
+    assert [r.labels for r in serial_records] == [r.labels for r in parallel_records]
+    assert serial_summary["comparison"] == parallel_summary["comparison"]
+
+
+def test_inspect_checkpoint_reuse_and_invalidation(tmp_path: Path):
+    raw = _write_synthetic_dataset(tmp_path, count=4)
+    first_records, first_summary = build_records(raw, workers=1, batch_size=2, progress=False)
+    second_records, second_summary = build_records(raw, workers=1, batch_size=2, progress=False)
+    assert [r.stem for r in first_records] == [r.stem for r in second_records]
+    image = raw / "extracted" / "set1" / "case_00.png"
+    cv2.imwrite(str(image), np.full((32, 32), 255, dtype=np.uint8))
+    third_records, _ = build_records(raw, workers=1, batch_size=2, progress=False)
+    assert [r.stem for r in first_records] == [r.stem for r in third_records]
+
+
+def test_inspect_worker_exception_surfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    raw = _write_synthetic_dataset(tmp_path, count=2)
+
+    def boom(path_str: str):
+        raise RuntimeError("bad file")
+
+    monkeypatch.setattr("scripts.prepare_dataset._inspect_image_worker", boom)
+    with pytest.raises(RuntimeError, match="inspect-images failed"):
+        build_records(raw, workers=2, batch_size=1, progress=False, force=True)

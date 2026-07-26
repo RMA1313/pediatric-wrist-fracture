@@ -2,14 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
+import hashlib
+import json
+import os
 import shutil
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import cv2
 import yaml
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -35,6 +41,210 @@ from wrist_fracture.data.preparation import (
     write_csv,
 )
 from wrist_fracture.paths import get_paths
+
+
+def _now() -> float:
+    return time.perf_counter()
+
+
+def _safe_print(message: str) -> None:
+    print(message, flush=True)
+
+
+def _default_workers() -> int:
+    cpu = os.cpu_count() or 1
+    return max(1, min(8, max(2, cpu // 3)))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _file_cache_key(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {"path": path.as_posix(), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _index_dataset_files(extracted: Path) -> dict[str, dict[str, Path]]:
+    index = {"images": {}, "xml": {}, "json": {}}
+    for path in sorted(extracted.rglob("*")):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix == ".png":
+            index["images"][path.stem] = path
+        elif suffix == ".xml":
+            index["xml"][path.stem] = path
+        elif suffix == ".json":
+            index["json"][path.stem] = path
+    return index
+
+
+def _inspect_image_worker(path_str: str) -> dict[str, Any]:
+    path = Path(path_str)
+    info = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if info is None:
+        return {"path": path.as_posix(), "corrupted": True}
+    return {
+        "path": path.as_posix(),
+        "corrupted": False,
+        "width": int(info.shape[1]),
+        "height": int(info.shape[0]),
+        "channels": 1 if info.ndim == 2 else int(info.shape[2]),
+        "dtype": str(info.dtype),
+    }
+
+
+def _parse_annotation_worker(item: tuple[str, str]) -> dict[str, Any]:
+    kind, path_str = item
+    path = Path(path_str)
+    if kind == "xml":
+        filename, width, height, boxes = parse_pascalvoc(path)
+        return {
+            "path": path.as_posix(),
+            "kind": "xml",
+            "filename": filename,
+            "width": width,
+            "height": height,
+            "boxes": [box.key() for box in boxes],
+            "raw_boxes": [
+                {
+                    "label": box.label,
+                    "xmin": box.xmin,
+                    "ymin": box.ymin,
+                    "xmax": box.xmax,
+                    "ymax": box.ymax,
+                    "source_format": box.source_format,
+                    "source_id": box.source_id,
+                }
+                for box in boxes
+            ],
+        }
+    width, height, boxes = parse_supervisely(path)
+    return {
+        "path": path.as_posix(),
+        "kind": "json",
+        "width": width,
+        "height": height,
+        "boxes": [box.key() for box in boxes],
+        "raw_boxes": [
+            {
+                "label": box.label,
+                "xmin": box.xmin,
+                "ymin": box.ymin,
+                "xmax": box.xmax,
+                "ymax": box.ymax,
+                "source_format": box.source_format,
+                "source_id": box.source_id,
+            }
+            for box in boxes
+        ],
+    }
+
+
+def _sha256_worker(path_str: str) -> dict[str, Any]:
+    path = Path(path_str)
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return {"path": path.as_posix(), "sha256": h.hexdigest(), "size": path.stat().st_size}
+
+
+def _compare_annotation_worker(item: tuple[str, str]) -> dict[str, Any]:
+    xml_path, json_path = item
+    xml = Path(xml_path)
+    js = Path(json_path)
+    _, _, _, x = parse_pascalvoc(xml)
+    _, _, j = parse_supervisely(js)
+    x_d = dedupe_boxes(x)
+    j_d = dedupe_boxes(j)
+    return {
+        "stem": xml.stem,
+        "boxes_match": len(x_d) == len(j_d)
+        and all(a.key() == b.key() for a, b in zip(x_d, j_d, strict=False)),
+        "xml_boxes": len(x_d),
+        "json_boxes": len(j_d),
+    }
+
+
+def _load_stage_cache(cache_path: Path) -> dict[str, Any]:
+    data = _load_json_file(cache_path)
+    if not data or not isinstance(data, dict):
+        return {"entries": {}}
+    if "entries" not in data or not isinstance(data["entries"], dict):
+        return {"entries": {}}
+    return data
+
+
+def _save_stage_cache(cache_path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_text(cache_path, json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _run_bounded(
+    *,
+    items: list[Any],
+    worker,
+    workers: int,
+    batch_size: int,
+    stage: str,
+    progress: bool,
+    use_processes: bool,
+) -> list[Any]:
+    executor_cls = (
+        cf.ProcessPoolExecutor if use_processes and workers > 1 else cf.ThreadPoolExecutor
+    )
+    if workers <= 1:
+        iterator = items
+        if progress:
+            iterator = tqdm(items, desc=stage, unit="item", leave=True)
+        return [worker(item) for item in iterator]
+
+    results: list[Any] = []
+    with executor_cls(max_workers=workers) as executor:
+        iterator = iter(items)
+        pending: dict[cf.Future[Any], Any] = {}
+
+        def submit_next() -> bool:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return False
+            pending[executor.submit(worker, item)] = item
+            return True
+
+        for _ in range(min(workers * batch_size, len(items))):
+            if not submit_next():
+                break
+
+        bar = tqdm(total=len(items), desc=stage, unit="item", leave=True) if progress else None
+        while pending:
+            done, _ = cf.wait(pending.keys(), return_when=cf.FIRST_COMPLETED)
+            for future in done:
+                item = pending.pop(future)
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    raise RuntimeError(f"{stage} failed for {item}") from exc
+                if bar:
+                    bar.update(1)
+                while len(pending) < workers * batch_size and submit_next():
+                    pass
+        if bar:
+            bar.close()
+    return results
 
 
 def load_dataset_assets(raw_dir: Path) -> dict[str, Path]:
@@ -76,10 +286,22 @@ def locate_annotation_root(extracted: Path) -> tuple[Path | None, Path | None, P
     )
 
 
-def build_records(raw_dir: Path) -> tuple[list[ImageRecord], dict[str, Any]]:
+def build_records(
+    raw_dir: Path,
+    *,
+    workers: int = 1,
+    hash_workers: int | None = None,
+    batch_size: int = 16,
+    progress: bool = False,
+    force: bool = False,
+) -> tuple[list[ImageRecord], dict[str, Any]]:
     assets = load_dataset_assets(raw_dir)
     csv_df = parse_dataset_csv(assets["dataset_csv"])
     extracted = assets["extracted"]
+    inspection_dir = raw_dir.parent / "interim" / "inspection"
+    inspection_dir.mkdir(parents=True, exist_ok=True)
+    index = _index_dataset_files(extracted)
+
     records: list[ImageRecord] = []
     summary = {
         "missing_images": 0,
@@ -87,50 +309,177 @@ def build_records(raw_dir: Path) -> tuple[list[ImageRecord], dict[str, Any]]:
         "invalid_images": 0,
         "formats": Counter(),
         "labels": Counter(),
+        "stage_times": {},
+        "stage_counts": {},
+        "duplicate_groups": 0,
+        "duplicate_files": 0,
+        "hash_mode": "candidate-groups",
     }
+
+    image_cache_path = inspection_dir / "image_inspection_cache.json"
+    annotation_cache_path = inspection_dir / "annotation_inspection_cache.json"
+    duplicate_cache_path = inspection_dir / "duplicate_index_cache.json"
+    comparison_cache_path = inspection_dir / "annotation_comparison_cache.json"
+
+    t0 = _now()
+    image_rows: list[dict[str, Any]] = []
     for _, row in csv_df.iterrows():
         stem = str(row.get("filestem") or row.get("filename") or row.get("image"))
         patient_id = str(row.get("patient_id")) if "patient_id" in row else None
         study_id = str(row.get("study_id")) if "study_id" in row else None
-        image_path = next(iter(sorted(extracted.rglob(f"{stem}.png"))), None)
+        image_path = index["images"].get(stem)
         if image_path is None:
             summary["missing_images"] += 1
             continue
-        info = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-        if info is None:
-            summary["invalid_images"] += 1
-            records.append(
-                ImageRecord(
-                    stem,
-                    image_path,
-                    None,
-                    None,
-                    patient_id,
-                    study_id,
-                    0,
-                    0,
-                    0,
-                    "",
-                    [],
-                    [],
-                    [],
-                    unreadable=True,
-                )
-            )
+        image_rows.append(
+            {
+                "stem": stem,
+                "patient_id": patient_id,
+                "study_id": study_id,
+                "image_path": image_path,
+                "xml_path": index["xml"].get(stem),
+                "json_path": index["json"].get(stem),
+            }
+        )
+    summary["stage_times"]["csv_join"] = _now() - t0
+    summary["stage_counts"]["csv_rows"] = len(csv_df)
+
+    image_cache = {} if force else _load_stage_cache(image_cache_path).get("entries", {})
+    annotation_cache = {} if force else _load_stage_cache(annotation_cache_path).get("entries", {})
+
+    t1 = _now()
+    image_items = []
+    image_results: dict[str, dict[str, Any]] = {}
+    for row in image_rows:
+        path = row["image_path"]
+        key = _file_cache_key(path)
+        cached = image_cache.get(row["stem"])
+        if cached and cached.get("key") == key:
+            image_results[row["stem"]] = cached["result"]
+        else:
+            image_items.append(path.as_posix())
+    if image_items:
+        image_outputs = _run_bounded(
+            items=image_items,
+            worker=_inspect_image_worker,
+            workers=workers,
+            batch_size=batch_size,
+            stage="inspect-images",
+            progress=progress,
+            use_processes=False,
+        )
+        for output in image_outputs:
+            image_results[Path(output["path"]).stem] = output
+    summary["stage_times"]["image_inspection"] = _now() - t1
+    summary["stage_counts"]["image_items"] = len(image_rows)
+
+    t2 = _now()
+    annotation_items: list[tuple[str, str]] = []
+    annotation_results: dict[str, dict[str, Any]] = {}
+    for row in image_rows:
+        ann = row["xml_path"] or row["json_path"]
+        if ann is None:
             continue
-        width, height = int(info.shape[1]), int(info.shape[0])
-        channels = 1 if info.ndim == 2 else int(info.shape[2])
-        dtype = str(info.dtype)
-        xml = next(iter(sorted(extracted.rglob(f"{stem}.xml"))), None)
-        js = next(iter(sorted(extracted.rglob(f"{stem}.json"))), None)
+        kind = "xml" if row["xml_path"] else "json"
+        key = _file_cache_key(ann)
+        cached = annotation_cache.get(ann.as_posix())
+        if cached and cached.get("key") == key:
+            annotation_results[row["stem"]] = cached["result"]
+        else:
+            annotation_items.append((kind, ann.as_posix()))
+    if annotation_items:
+        annotation_outputs = _run_bounded(
+            items=annotation_items,
+            worker=_parse_annotation_worker,
+            workers=workers,
+            batch_size=batch_size,
+            stage="parse-annotations",
+            progress=progress,
+            use_processes=True,
+        )
+        for output in annotation_outputs:
+            annotation_results[Path(output["path"]).stem] = output
+    summary["stage_times"]["annotation_parsing"] = _now() - t2
+    summary["stage_counts"]["annotation_items"] = len(annotation_items) + len(annotation_results)
+
+    t3 = _now()
+    comparable_pairs = [
+        (row["xml_path"].as_posix(), row["json_path"].as_posix(), row["stem"])
+        for row in image_rows
+        if row["xml_path"] and row["json_path"]
+    ]
+    comparison_results = []
+    comparison_cache = {} if force else _load_stage_cache(comparison_cache_path).get("entries", {})
+    compare_items = []
+    for xml_path, json_path, _stem in comparable_pairs:
+        key = f"{xml_path}|{json_path}"
+        cached = comparison_cache.get(key)
+        if cached and cached.get("xml_key") == _file_cache_key(Path(xml_path)) and cached.get(
+            "json_key"
+        ) == _file_cache_key(Path(json_path)):
+            comparison_results.append(cached["result"])
+        else:
+            compare_items.append((xml_path, json_path))
+    if compare_items:
+        comparison_results.extend(
+            _run_bounded(
+                items=compare_items,
+                worker=_compare_annotation_worker,
+                workers=workers,
+                batch_size=batch_size,
+                stage="compare-annotations",
+                progress=progress,
+                use_processes=True,
+            )
+        )
+    summary["stage_times"]["annotation_comparison"] = _now() - t3
+    summary["stage_counts"]["comparison_pairs"] = len(comparable_pairs)
+
+    t4 = _now()
+    all_files = [row["image_path"] for row in image_rows]
+    size_groups: dict[int, list[Path]] = defaultdict(list)
+    for path in all_files:
+        size_groups[path.stat().st_size].append(path)
+    candidate_groups = [paths for paths in size_groups.values() if len(paths) > 1]
+    hash_items = [p.as_posix() for group in candidate_groups for p in group]
+    hash_results: list[dict[str, Any]] = []
+    if hash_items:
+        hash_results = _run_bounded(
+            items=hash_items,
+            worker=_sha256_worker,
+            workers=hash_workers or workers,
+            batch_size=batch_size,
+            stage="hash-candidates",
+            progress=progress,
+            use_processes=True,
+        )
+    hash_by_path = {r["path"]: r for r in hash_results}
+    duplicates: list[dict[str, Any]] = []
+    for group in candidate_groups:
+        groups_by_hash: dict[str, list[str]] = defaultdict(list)
+        for path in group:
+            result = hash_by_path.get(path.as_posix())
+            if result:
+                groups_by_hash[result["sha256"]].append(path.as_posix())
+        for paths in groups_by_hash.values():
+            if len(paths) > 1:
+                duplicates.append({"paths": sorted(paths), "size": Path(paths[0]).stat().st_size})
+    summary["duplicate_groups"] = len(duplicates)
+    summary["duplicate_files"] = sum(len(group["paths"]) for group in duplicates)
+    summary["stage_times"]["duplicate_screening"] = _now() - t4
+
+    for row in image_rows:
+        image_info = image_results.get(row["stem"], {})
+        ann_result = annotation_results.get(row["stem"])
         boxes: list[AnnotationBox] = []
         fmt = None
-        if xml and xml.exists():
-            _, _, _, boxes = parse_pascalvoc(xml)
-            fmt = "pascalvoc"
-        elif js and js.exists():
-            _, _, boxes = parse_supervisely(js)
-            fmt = "supervisely"
+        ann_path = row["xml_path"] or row["json_path"]
+        if ann_result:
+            fmt = ann_result["kind"]
+            boxes = [
+                AnnotationBox(**box)
+                for box in ann_result.get("raw_boxes", [])
+            ]
         if not boxes:
             summary["missing_annotations"] += 1
         boxes = dedupe_boxes(boxes)
@@ -138,23 +487,77 @@ def build_records(raw_dir: Path) -> tuple[list[ImageRecord], dict[str, Any]]:
         summary["formats"][fmt or "missing"] += 1
         for b in boxes:
             summary["labels"][b.label] += 1
+        if image_info.get("corrupted"):
+            summary["invalid_images"] += 1
         records.append(
             ImageRecord(
-                stem,
-                image_path,
-                xml or js,
-                fmt,
-                patient_id,
-                study_id,
-                width,
-                height,
-                channels,
-                dtype,
+                row["stem"],
+                row["image_path"],
+                ann_path,
+                "pascalvoc" if fmt == "xml" else "supervisely" if fmt == "json" else None,
+                row["patient_id"],
+                row["study_id"],
+                int(image_info.get("width", 0)),
+                int(image_info.get("height", 0)),
+                int(image_info.get("channels", 0)),
+                str(image_info.get("dtype", "")),
                 fracture_boxes,
                 boxes,
                 sorted({b.label for b in boxes}),
+                unreadable=bool(image_info.get("corrupted")),
             )
         )
+
+    image_cache_entries = {
+        row["stem"]: {
+            "key": _file_cache_key(row["image_path"]),
+            "result": image_results[row["stem"]],
+        }
+        for row in image_rows
+        if row["stem"] in image_results
+    }
+    annotation_cache_entries = {
+        (
+            row["xml_path"].as_posix() if row["xml_path"] else row["json_path"].as_posix()
+        ): {
+            "key": _file_cache_key(row["xml_path"] or row["json_path"]),
+            "result": annotation_results[row["stem"]],
+        }
+        for row in image_rows
+        if row["stem"] in annotation_results
+    }
+    comparison_cache_entries: dict[str, Any] = {}
+    for result in comparison_results:
+        stem = result["stem"]
+        pair = next((pair for pair in comparable_pairs if pair[2] == stem), None)
+        if pair is None:
+            continue
+        xml_path, json_path, _ = pair
+        comparison_cache_entries[f"{xml_path}|{json_path}"] = {
+            "xml_key": _file_cache_key(Path(xml_path)),
+            "json_key": _file_cache_key(Path(json_path)),
+            "result": result,
+        }
+    duplicate_cache_entries = {
+        item["path"]: {
+            "key": _file_cache_key(Path(item["path"])),
+            "result": item,
+        }
+        for item in hash_results
+    }
+    _save_stage_cache(image_cache_path, {"entries": image_cache_entries})
+    _save_stage_cache(annotation_cache_path, {"entries": annotation_cache_entries})
+    _save_stage_cache(comparison_cache_path, {"entries": comparison_cache_entries})
+    _save_stage_cache(duplicate_cache_path, {"entries": duplicate_cache_entries})
+    summary["comparison"] = {
+        "paired_images": len(comparable_pairs),
+        "sample_compared": len(comparison_results),
+        "matching": sum(1 for item in comparison_results if item["boxes_match"]),
+        "mismatching": sum(1 for item in comparison_results if not item["boxes_match"]),
+        "xml_only": len(index["xml"]) - len(comparable_pairs),
+        "json_only": len(index["json"]) - len(comparable_pairs),
+    }
+    summary["stage_times"]["total"] = _now() - t0
     return records, summary
 
 
@@ -444,9 +847,34 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    records, summary = build_records(args.raw_dir)
-    comparison = compare_annotation_formats(args.raw_dir)
-    save_json(args.report_json, summarize(records, comparison))
+    started = _now()
+    _safe_print(
+        "inspect: "
+        f"raw_dir={args.raw_dir} "
+        f"workers={args.workers} "
+        f"hash_workers={args.hash_workers or args.workers} "
+        f"batch_size={args.batch_size}"
+    )
+    records, summary = build_records(
+        args.raw_dir,
+        workers=args.workers,
+        hash_workers=args.hash_workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+        force=args.force,
+    )
+    comparison = summary.get("comparison", compare_annotation_formats(args.raw_dir))
+    report = summarize(records, comparison)
+    report["profiling"] = {
+        "stage_times": summary.get("stage_times", {}),
+        "stage_counts": summary.get("stage_counts", {}),
+        "duplicate_groups": summary.get("duplicate_groups", 0),
+        "duplicate_files": summary.get("duplicate_files", 0),
+        "hash_mode": summary.get("hash_mode"),
+        "workers": args.workers,
+        "hash_workers": args.hash_workers or args.workers,
+    }
+    save_json(args.report_json, report)
     write_csv(
         args.report_csv,
         [
@@ -465,6 +893,16 @@ def cmd_inspect(args: argparse.Namespace) -> int:
             for r in records
         ],
     )
+    elapsed = _now() - started
+    _safe_print(
+        "inspect complete: "
+        f"images={len(records)} "
+        f"elapsed={elapsed:.1f}s "
+        f"missing_images={summary['missing_images']} "
+        f"invalid_images={summary['invalid_images']} "
+        f"duplicate_groups={summary['duplicate_groups']}"
+    )
+    _safe_print(f"stage timing: {report['profiling']['stage_times']}")
     return 0
 
 
@@ -526,6 +964,11 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument(
         "--report-csv", type=Path, default=get_paths().dataset_reports / "dataset_report.csv"
     )
+    i.add_argument("--workers", type=int, default=_default_workers())
+    i.add_argument("--hash-workers", type=int, default=None)
+    i.add_argument("--batch-size", type=int, default=16)
+    i.add_argument("--force", action="store_true")
+    i.add_argument("--progress", action="store_true")
     i.set_defaults(func=cmd_inspect)
 
     c = sub.add_parser("convert")
