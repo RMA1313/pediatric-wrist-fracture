@@ -14,7 +14,7 @@ data/interim/
 data/processed/
 data/splits/
 data/downloads/
-
+runs/detect/
 outputs/*
 !outputs/.gitkeep
 !outputs/audits/.gitkeep
@@ -39,3 +39,5 @@ outputs/*
 *.bak
 *.swp
 
+C:/tmp/run/raw/train/results.csv
+C:/tmp/run/interrupted.marker

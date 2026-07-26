@@ -243,7 +243,7 @@ def test_full_overlay_still_resolves_full_protocol(tmp_path: Path):
     assert cfg.image_size == 640
     assert cfg.epochs == 100
     assert cfg.patience == 20
-    assert cfg.batch_size == 1
+    assert cfg.batch_size == 64
     assert cfg.run.repeated_runs == 1
 
 
@@ -779,6 +779,8 @@ def test_gpu_preflight_cpu_mode(
 
 
 def test_gpu_preflight_require_gpu_fails(monkeypatch: pytest.MonkeyPatch):
+    import sys
+
     monkeypatch.setattr(
         gpu_preflight,
         "collect_environment_report",
@@ -792,6 +794,7 @@ def test_gpu_preflight_require_gpu_fails(monkeypatch: pytest.MonkeyPatch):
             },
         )(),
     )
+    monkeypatch.setitem(sys.modules, "torch", None)
     with pytest.raises(SystemExit, match="GPU required"):
         monkeypatch.setattr(
             gpu_preflight.argparse.ArgumentParser,

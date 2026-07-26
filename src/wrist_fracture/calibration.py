@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from wrist_fracture.provenance import (
 CALIBRATION_BATCH_CANDIDATES = (8, 16, 32, 48, 64)
 CALIBRATION_MAX_BATCHES = 3
 CALIBRATED_MODEL_ORDER = ("yolov8", "yolov9", "yolo26")
+CALIBRATION_SCHEMA_VERSION = 2
 
 
 def now_utc() -> str:
@@ -184,6 +186,52 @@ def write_atomic(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
+def execution_root(out_dir: Path, execution_id: str) -> Path:
+    return out_dir / "executions" / execution_id
+
+
+def execution_id_for_report(report: dict[str, Any]) -> str:
+    digest_source = json.dumps(_json_safe(report), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(digest_source).hexdigest()[:16]
+
+
+def report_provenance_kind(report: dict[str, Any]) -> str:
+    candidate_statuses = {row.get("status") for row in report.get("candidates", [])}
+    if candidate_statuses <= {"planned"}:
+        return "planned"
+    if candidate_statuses & {"stable", "oom", "failed", "skipped", "skipped_after_oom"}:
+        return "real"
+    return "unknown"
+
+
+def report_has_complete_real_evidence(report: dict[str, Any]) -> bool:
+    candidates = report.get("candidates", [])
+    if not candidates:
+        return False
+    if report.get("common_stable_batch") is None:
+        return False
+    if report.get("stable_candidate_count", 0) <= 0:
+        return False
+    if any(row.get("status") == "planned" for row in candidates):
+        return False
+    model_families = {row.get("model_family") for row in candidates}
+    if report.get("model_family") == "all":
+        if not {"yolov8", "yolov9", "yolo26"}.issubset(model_families):
+            return False
+        for model_family in CALIBRATED_MODEL_ORDER:
+            rows = [row for row in candidates if row.get("model_family") == model_family]
+            if not any(row.get("status") == "stable" for row in rows):
+                return False
+    else:
+        model_family = report.get("model_family")
+        rows = [row for row in candidates if row.get("model_family") == model_family]
+        if not rows:
+            return False
+        if not any(row.get("status") == "stable" for row in rows):
+            return False
+    return True
+
+
 def write_reports(
     out_dir: Path,
     *,
@@ -222,6 +270,103 @@ def write_reports(
         out_dir / "recommended_full_config.yaml",
         yaml.safe_dump({"experiment": recommended_config}, sort_keys=False),
     )
+
+
+def write_execution_artifacts(
+    out_dir: Path,
+    *,
+    execution_id: str,
+    report: dict[str, Any],
+    hardware_profile: dict[str, Any],
+    stage_timings: dict[str, Any],
+    environment: dict[str, Any],
+    commands: list[str],
+    recommended_config: dict[str, Any],
+    application_record: dict[str, Any] | None = None,
+) -> Path:
+    root = execution_root(out_dir, execution_id)
+    write_reports(
+        root,
+        report=report,
+        hardware_profile=hardware_profile,
+        stage_timings=stage_timings,
+        environment=environment,
+        commands=commands,
+        recommended_config=recommended_config,
+    )
+    write_atomic(
+        root / "execution_manifest.json",
+        json.dumps(
+            {
+                "execution_id": execution_id,
+                "schema_version": CALIBRATION_SCHEMA_VERSION,
+                "timestamp_utc": now_utc(),
+                "provenance": report_provenance_kind(report),
+                "report_sha256": hashlib.sha256(
+                    json.dumps(_json_safe(report), sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+    if application_record is not None:
+        write_atomic(
+            root / "application_record.json",
+            json.dumps(_json_safe(application_record), indent=2, sort_keys=True),
+        )
+    (root / "completed.marker").write_text(now_utc(), encoding="utf-8")
+    return root
+
+
+def load_calibration_report(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def discover_latest_completed_execution(out_dir: Path) -> Path | None:
+    executions_dir = out_dir / "executions"
+    if not executions_dir.exists():
+        return None
+    candidates = []
+    for path in sorted(executions_dir.iterdir()):
+        if (path / "completed.marker").exists() and (path / "calibration_report.json").exists():
+            report = load_calibration_report(path / "calibration_report.json")
+            if report and report_has_complete_real_evidence(report):
+                candidates.append(path)
+    return max(candidates, key=lambda p: p.name) if candidates else None
+
+
+def recover_legacy_execution(out_dir: Path) -> Path | None:
+    legacy_report = load_calibration_report(out_dir / "calibration_report.json")
+    if not legacy_report or not report_has_complete_real_evidence(legacy_report):
+        return None
+    execution_id = legacy_report.get("execution_id") or execution_id_for_report(legacy_report)
+    root = execution_root(out_dir, execution_id)
+    if root.exists() and (root / "completed.marker").exists():
+        return root
+    hardware_profile = load_calibration_report(out_dir / "hardware_profile.json") or {}
+    stage_timings = load_calibration_report(out_dir / "stage_timings.json") or {}
+    environment = load_calibration_report(out_dir / "environment.json") or {}
+    commands = (out_dir / "commands.txt").read_text(encoding="utf-8").splitlines()
+    recommended_config_path = out_dir / "recommended_full_config.yaml"
+    recommended_config = {}
+    if recommended_config_path.exists():
+        recommended_payload = yaml.safe_load(recommended_config_path.read_text(encoding="utf-8"))
+        if isinstance(recommended_payload, dict):
+            recommended_config = recommended_payload.get("experiment", recommended_payload)
+    write_execution_artifacts(
+        out_dir,
+        execution_id=execution_id,
+        report=legacy_report,
+        hardware_profile=hardware_profile,
+        stage_timings=stage_timings,
+        environment=environment,
+        commands=commands,
+        recommended_config=recommended_config,
+    )
+    return root
 
 
 @dataclass

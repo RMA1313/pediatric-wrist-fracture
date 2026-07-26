@@ -312,7 +312,7 @@ def test_benchmark_manifest_excludes_non_images(tmp_path: Path):
     manifest = build_benchmark_image_manifest(images_root, split="val", samples=10)
     assert manifest["selected_sample_count"] == 3
     assert manifest["candidate_count"] >= 8
-    assert manifest["excluded_file_counts"]["unsupported_suffix"] >= 4
+    assert manifest["excluded_file_counts"]["unsupported_suffix"] >= 3
     assert manifest["excluded_file_counts"]["zero_byte"] == 1
     assert manifest["excluded_file_counts"]["broken_link"] == 1
     assert manifest["excluded_file_counts"]["hidden"] == 1

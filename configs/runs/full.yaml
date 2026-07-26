@@ -9,3 +9,5 @@ run:
   selection_metric: metrics/mAP50-95(B)
   repeated_runs: 1
   batch_size_policy: fixed
+  batch_size: 64
+batch_size: 64

@@ -14,9 +14,15 @@ from wrist_fracture.calibration import (
     build_recommended_full_config,
     build_resume_state,
     candidate_batches,
+    discover_latest_completed_execution,
     flatten_candidate_rows,
+    load_calibration_report,
     now_utc,
+    recover_legacy_execution,
+    report_has_complete_real_evidence,
     update_run_config_batch,
+    write_atomic,
+    write_execution_artifacts,
     write_reports,
     write_resume_state,
 )
@@ -31,6 +37,11 @@ def _default_output_dir(root: Path) -> Path:
 
 def _load_resume_state(path: Path) -> dict[str, Any] | None:
     if not path.exists():
+        exec_root = discover_latest_completed_execution(path.parent)
+        if exec_root is not None:
+            state_path = exec_root / "resume_state.json"
+            if state_path.exists():
+                return json.loads(state_path.read_text(encoding="utf-8"))
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -92,6 +103,19 @@ def _candidate_plan(
     return rows
 
 
+def _plan_only_rows(target_models: list[str], batches: list[int]) -> list[dict[str, Any]]:
+    return [
+        {
+            "model_family": model_family,
+            "batch_size": batch,
+            "status": "planned",
+            "status_detail": "dry-run only",
+        }
+        for model_family in target_models
+        for batch in batches
+    ]
+
+
 def _selected_common_batch(
     results_by_model: dict[str, list[dict[str, Any]]], fallback: int
 ) -> int | None:
@@ -102,6 +126,20 @@ def _selected_common_batch(
             return None
         largest_stables.append(max(stable))
     return min(largest_stables) if largest_stables else None
+
+
+def _execution_persistence_root(out_dir: Path) -> Path:
+    return out_dir / "executions"
+
+
+def _load_effective_evidence(out_dir: Path) -> tuple[Path | None, dict[str, Any] | None]:
+    recovered = discover_latest_completed_execution(out_dir) or recover_legacy_execution(out_dir)
+    if recovered is None:
+        return None, None
+    report = load_calibration_report(recovered / "calibration_report.json")
+    if not report_has_complete_real_evidence(report or {}):
+        return None, None
+    return recovered, report
 
 
 def run(args: argparse.Namespace) -> int:
@@ -118,8 +156,98 @@ def run(args: argparse.Namespace) -> int:
         _parse_candidate_batches(getattr(args, "candidate_batches", None)) or candidate_batches()
     )
     target_models = [base_cfg.model.family] if args.model_config else list(CALIBRATED_MODEL_ORDER)
+    if args.apply and not args.execute:
+        evidence_root, evidence = _load_effective_evidence(out_dir)
+        if evidence_root is None or evidence is None:
+            raise ConfigError("apply requires complete real calibration evidence")
+        if not report_has_complete_real_evidence(evidence):
+            raise ConfigError("apply requires complete real calibration evidence")
+        selected_batch = evidence.get("common_stable_batch")
+        if selected_batch is None:
+            raise ConfigError("apply requires a selected common stable batch")
+        update_run_config_batch(root / "configs" / "runs" / "full.yaml", batch_size=selected_batch)
+        applied_cfg = load_config_bundle(
+            args.config,
+            model_path=Path(args.model_config or f"configs/models/{target_models[0]}.yaml"),
+            hardware_path=args.hardware_config,
+            run_path=root / "configs" / "runs" / "full.yaml",
+        )
+        if applied_cfg.batch_size != selected_batch:
+            raise ConfigError("applied calibration batch did not propagate into ExperimentConfig")
+        write_atomic(
+            evidence_root / "application_record.json",
+            json.dumps(
+                {
+                    "execution_id": evidence.get("execution_id") or evidence_root.name,
+                    "report_sha256": evidence.get("report_sha256"),
+                    "selected_batch": selected_batch,
+                    "applied_batch": applied_cfg.batch_size,
+                    "timestamp_utc": now_utc(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+        return 0
+    if not args.execute and not args.apply:
+        candidate_rows = _plan_only_rows(target_models, batches)
+        report = build_calibration_report(
+            cfg=base_cfg,
+            model_family="all" if len(target_models) > 1 else target_models[0],
+            candidates=candidate_rows,
+            recommended_batch_size=None,
+            applied=False,
+            resume_state=build_resume_state(
+                model_family="all" if len(target_models) > 1 else target_models[0],
+                candidate_order=batches,
+                results=candidate_rows,
+            ),
+        )
+        hardware_profile = build_hardware_profile(base_cfg)
+        environment = {
+            "timestamp_utc": now_utc(),
+            "git_commit": git_commit(root),
+            "git_dirty": git_dirty(root),
+            "environment": to_jsonable(collect_environment_report(root)),
+        }
+        commands = [
+            build_command(
+                model_path=Path(args.model_config or f"configs/models/{target_models[0]}.yaml"),
+                hardware_path=Path(args.hardware_config or "configs/hardware/rtx4090.yaml"),
+                run_path=Path(args.run_config or "configs/runs/full.yaml"),
+                execute=False,
+            )
+        ]
+        recommended_config = build_recommended_full_config(base_cfg, batch_size=base_cfg.batch_size)
+        write_atomic(
+            out_dir / "calibration_plan.json",
+            json.dumps(report, indent=2, sort_keys=True),
+        )
+        write_atomic(
+            out_dir / "calibration_plan.csv",
+            "\n".join([",".join(map(str, row.values())) for row in candidate_rows]) + "\n",
+        )
+        if not report_has_complete_real_evidence(
+            load_calibration_report(out_dir / "calibration_report.json") or {}
+        ):
+            write_reports(
+                out_dir,
+                report=report,
+                hardware_profile=hardware_profile,
+                stage_timings={
+                    "planning_seconds": 0.0,
+                    "selection_seconds": 0.0,
+                    "reporting_seconds": 0.0,
+                },
+                environment=environment,
+                commands=commands,
+                recommended_config=recommended_config,
+            )
+        if args.print_report:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+
     per_model_rows: dict[str, list[dict[str, Any]]] = {}
-    evidence_ready = False
     if args.execute:
         for model_family in target_models:
             model_cfg = load_config_bundle(
@@ -143,31 +271,6 @@ def run(args: argparse.Namespace) -> int:
             )
             per_model_rows[model_family] = candidate_rows
         recommended_batch = _selected_common_batch(per_model_rows, base_cfg.batch_size)
-        evidence_ready = all(
-            any(row["status"] == "stable" for row in rows) for rows in per_model_rows.values()
-        )
-        candidate_rows = flatten_candidate_rows(per_model_rows)
-    else:
-        for model_family in target_models:
-            load_config_bundle(
-                args.config,
-                model_path=Path(args.model_config)
-                if args.model_config
-                else Path(f"configs/models/{model_family}.yaml"),
-                hardware_path=args.hardware_config,
-                run_path=args.run_config,
-            )
-            candidate_rows = [
-                {
-                    "model_family": model_family,
-                    "batch_size": batch,
-                    "status": "planned",
-                    "status_detail": "dry-run only",
-                }
-                for batch in batches
-            ]
-            per_model_rows[model_family] = candidate_rows
-        recommended_batch = None
         candidate_rows = flatten_candidate_rows(per_model_rows)
     report = build_calibration_report(
         cfg=base_cfg,
@@ -198,14 +301,18 @@ def run(args: argparse.Namespace) -> int:
             model_path=Path(args.model_config or f"configs/models/{target_models[0]}.yaml"),
             hardware_path=Path(args.hardware_config or "configs/hardware/rtx4090.yaml"),
             run_path=Path(args.run_config or "configs/runs/full.yaml"),
-            execute=False,
+            execute=True,
         ),
     ]
     recommended_config = build_recommended_full_config(
         base_cfg, batch_size=recommended_batch or base_cfg.batch_size
     )
-    write_reports(
+    execution_id = (
+        report.get("execution_id") or f"calib-{now_utc().replace(':', '').replace('-', '')}"
+    )
+    execution_root = write_execution_artifacts(
         out_dir,
+        execution_id=execution_id,
         report=report,
         hardware_profile=hardware_profile,
         stage_timings=stage_timings,
@@ -214,30 +321,47 @@ def run(args: argparse.Namespace) -> int:
         recommended_config=recommended_config,
     )
     write_resume_state(
-        out_dir,
+        execution_root,
         build_resume_state(
             model_family=("all" if len(target_models) > 1 else target_models[0]),
             candidate_order=batches,
             results=candidate_rows,
         ),
     )
-    (out_dir / "completed.marker").write_text(now_utc(), encoding="utf-8")
     if args.print_report:
         print(json.dumps(report, indent=2, sort_keys=True))
     if args.apply:
-        if not evidence_ready:
-            raise ConfigError("apply requires complete real calibration evidence for the model")
-        update_run_config_batch(
-            root / "configs" / "runs" / "full.yaml", batch_size=recommended_batch
-        )
+        evidence_root, evidence = _load_effective_evidence(out_dir)
+        if evidence_root is None or evidence is None:
+            raise ConfigError("apply requires complete real calibration evidence")
+        if not report_has_complete_real_evidence(evidence):
+            raise ConfigError("apply requires complete real calibration evidence")
+        selected_batch = evidence.get("common_stable_batch")
+        if selected_batch is None:
+            raise ConfigError("apply requires a selected common stable batch")
+        update_run_config_batch(root / "configs" / "runs" / "full.yaml", batch_size=selected_batch)
         applied_cfg = load_config_bundle(
             args.config,
             model_path=Path(args.model_config or f"configs/models/{target_models[0]}.yaml"),
             hardware_path=args.hardware_config,
             run_path=root / "configs" / "runs" / "full.yaml",
         )
-        if applied_cfg.batch_size != recommended_batch:
+        if applied_cfg.batch_size != selected_batch:
             raise ConfigError("applied calibration batch did not propagate into ExperimentConfig")
+        write_atomic(
+            evidence_root / "application_record.json",
+            json.dumps(
+                {
+                    "execution_id": evidence.get("execution_id") or evidence_root.name,
+                    "report_sha256": evidence.get("report_sha256"),
+                    "selected_batch": selected_batch,
+                    "applied_batch": applied_cfg.batch_size,
+                    "timestamp_utc": now_utc(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
     return 0
 
 

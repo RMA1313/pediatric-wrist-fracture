@@ -12,6 +12,7 @@ from wrist_fracture.calibration import (
     build_recommended_full_config,
     build_resume_state,
     candidate_batches,
+    report_has_complete_real_evidence,
     select_largest_common_stable_batch,
     select_largest_stable_batch,
     update_run_config_batch,
@@ -229,7 +230,10 @@ def test_report_generation_writes_expected_files(tmp_path: Path, monkeypatch: py
         ),
     )
     assert calibrate.main() == 0
-    out_dir = tmp_path / "outputs/calibration"
+    out_dir = tmp_path / "outputs/calibration/executions"
+    exec_dirs = list(out_dir.iterdir())
+    assert exec_dirs
+    out_dir = exec_dirs[0]
     for name in [
         "calibration_report.json",
         "calibration_report.csv",
@@ -241,6 +245,9 @@ def test_report_generation_writes_expected_files(tmp_path: Path, monkeypatch: py
         "resume_state.json",
     ]:
         assert (out_dir / name).exists()
+    assert report_has_complete_real_evidence(
+        json.loads((out_dir / "calibration_report.json").read_text(encoding="utf-8"))
+    )
 
 
 def test_oom_handling_and_candidate_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -306,9 +313,8 @@ def test_oom_handling_and_candidate_order(tmp_path: Path, monkeypatch: pytest.Mo
     )
     assert calibrate.main() == 0
     assert seen == [8]
-    report = json.loads(
-        (tmp_path / "outputs/calibration/calibration_report.json").read_text(encoding="utf-8")
-    )
+    exec_dir = next((tmp_path / "outputs/calibration/executions").iterdir())
+    report = json.loads((exec_dir / "calibration_report.json").read_text(encoding="utf-8"))
     assert report["candidates"][0]["status"] == "oom"
     assert report["recommended_batch_size"] is None
 
@@ -446,3 +452,49 @@ def test_apply_updates_only_full_run_and_validates_config(
         run_path=tmp_path / "configs/runs/full.yaml",
     )
     assert updated.batch_size == 16
+
+
+def test_dry_run_preserves_existing_execution_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _write_minimal_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    execution_root = tmp_path / "outputs/calibration/executions/existing"
+    execution_root.mkdir(parents=True, exist_ok=True)
+    (execution_root / "calibration_report.json").write_text(
+        json.dumps(
+            {
+                "common_stable_batch": 16,
+                "stable_candidate_count": 3,
+                "candidates": [
+                    {"model_family": "yolov8", "batch_size": 16, "status": "stable"},
+                    {"model_family": "yolov9", "batch_size": 16, "status": "stable"},
+                    {"model_family": "yolo26", "batch_size": 16, "status": "stable"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (execution_root / "completed.marker").write_text("done", encoding="utf-8")
+    before = (execution_root / "calibration_report.json").read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        calibrate.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: SimpleNamespace(
+            config="configs/experiment.yaml",
+            model_config="configs/models/yolov8.yaml",
+            hardware_config="configs/hardware/rtx4090.yaml",
+            run_config="configs/runs/full.yaml",
+            output_dir=str(tmp_path / "outputs/calibration"),
+            dry_run=True,
+            execute=False,
+            apply=False,
+            resume=False,
+            force=False,
+            continue_on_error=False,
+            print_report=False,
+            candidate_batches="8,16",
+        ),
+    )
+    assert calibrate.main() == 0
+    assert (execution_root / "calibration_report.json").read_text(encoding="utf-8") == before
