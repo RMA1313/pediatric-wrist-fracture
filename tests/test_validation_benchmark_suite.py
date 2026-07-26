@@ -8,6 +8,7 @@ import pytest
 from scripts import benchmark, evaluate
 from scripts import run_validation_benchmark_suite as suite
 
+from wrist_fracture import runtime
 from wrist_fracture.config import ConfigError
 from wrist_fracture.validation_benchmark_suite import (
     _percentile,
@@ -134,6 +135,35 @@ def test_suite_missing_model_run_rejected(tmp_path: Path):
     )
     with pytest.raises(ConfigError, match="missing requested model runs"):
         select_runs([{"model_family": "yolov8"}], ["yolov8", "yolov9"])
+
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [
+        ("cpu", "cpu"),
+        ("cuda", "0"),
+        ("cuda:0", "0"),
+        ("cuda:1", "1"),
+        (0, "0"),
+        (1, "1"),
+    ],
+)
+def test_normalize_device_cases(device, expected):
+    assert runtime.normalize_device(device) == expected
+
+
+def test_package_modules_import_without_scripts_hack():
+    __import__("wrist_fracture.validation_benchmark_suite")
+    __import__("wrist_fracture.smoke_suite")
+    __import__("wrist_fracture.runtime")
+
+
+def test_validation_benchmark_module_has_no_scripts_dependency():
+    import wrist_fracture.validation_benchmark_suite as module
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "from scripts" not in source
+    assert "import scripts" not in source
 
 
 def test_resolve_checkpoint_accepts_direct_pt(tmp_path: Path):

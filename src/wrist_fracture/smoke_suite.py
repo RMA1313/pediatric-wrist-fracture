@@ -6,7 +6,6 @@ import json
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +24,14 @@ from wrist_fracture.provenance import (  # noqa: E402
     sha256_file,
     to_jsonable,
 )
+from wrist_fracture.runtime import (  # noqa: E402
+    execute_training_with_args,
+    now_utc,
+    persist_run_metadata,
+    recover_training_artifacts,
+    run_root,
+)
+from wrist_fracture.transfer_manifest import build_manifest, verify_manifest  # noqa: E402
 
 MODEL_ORDER = ("yolov8", "yolov9", "yolo26")
 MODEL_CONFIGS = {
@@ -33,22 +40,7 @@ MODEL_CONFIGS = {
     "yolo26": Path("configs/models/yolo26.yaml"),
 }
 SMOKE_CAPS = {"epochs": 1, "image_size": 320, "batch_size": 4, "patience": 1, "repeated_runs": 1}
-
-
-def _train_module():
-    from scripts import train
-
-    return train
-
-
-def _transfer_manifest_module():
-    from scripts import transfer_manifest
-
-    return transfer_manifest
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+_now = now_utc
 
 
 def default_suite_id() -> str:
@@ -161,9 +153,8 @@ def _gpu_preflight() -> dict[str, Any]:
 
 
 def _dataset_preflight(root: Path, dataset_yaml: Path) -> dict[str, Any]:
-    transfer_manifest = _transfer_manifest_module()
-    manifest = transfer_manifest.build_manifest(root, dataset_yaml)
-    errors = transfer_manifest.verify_manifest(manifest, root, dataset_yaml)
+    manifest = build_manifest(root, dataset_yaml)
+    errors = verify_manifest(manifest, root, dataset_yaml)
     if errors:
         raise ConfigError("; ".join(errors))
     return manifest
@@ -372,7 +363,6 @@ class SuiteResult:
 
 
 def run_suite(args: argparse.Namespace) -> int:
-    train = _train_module()
     root = Path.cwd()
     suite_id = args.suite_id or default_suite_id()
     models = normalize_models(args.models)
@@ -426,43 +416,43 @@ def run_suite(args: argparse.Namespace) -> int:
         log("stage 5: sequential one-epoch smoke training")
         for model in models:
             cfg = build_config(model, suite_id, root=root)
-            run_root = train.run_root(cfg, cfg.run.run_id or "")
-            if args.skip_completed and (run_root / "completed.marker").exists():
+            run_root_path = run_root(cfg, cfg.run.run_id or "")
+            if args.skip_completed and (run_root_path / "completed.marker").exists():
                 summaries.append(
                     {
                         **summarize_run(
-                            cfg, run_root, status="skipped", recovery_used=False, error=None
+                            cfg, run_root_path, status="skipped", recovery_used=False, error=None
                         ),
                         "status": "skipped",
                     }
                 )
                 continue
-            if run_root.exists() and (run_root / "completed.marker").exists():
-                raise ConfigError(f"completed run may not be overwritten: {run_root}")
+            if run_root_path.exists() and (run_root_path / "completed.marker").exists():
+                raise ConfigError(f"completed run may not be overwritten: {run_root_path}")
             log(f"model {model}: train")
             train_args = argparse.Namespace(execute=True, smoke=True)
-            train.persist_run_metadata(run_root, cfg, train_args)
+            persist_run_metadata(run_root_path, cfg, train_args)
             error: str | None = None
             recovery_used = False
             try:
-                train._execute_training_with_args(cfg, run_root, train_args)
+                execute_training_with_args(cfg, run_root_path, train_args)
             except Exception as exc:
                 error = str(exc)
-                if (run_root / "raw").exists() and args.recover:
+                if (run_root_path / "raw").exists() and args.recover:
                     log(f"model {model}: recovery")
-                    train._recover_from_run_root(run_root)
+                    recover_training_artifacts(run_root_path)
                     recovery_used = True
                 elif not args.continue_on_error:
                     raise
-            if error is None and (run_root / "completed.marker").exists():
-                validation_errors = validate_artifacts(run_root)
+            if error is None and (run_root_path / "completed.marker").exists():
+                validation_errors = validate_artifacts(run_root_path)
                 if validation_errors:
                     error = "; ".join(validation_errors)
-                    if (run_root / "raw").exists() and args.recover:
+                    if (run_root_path / "raw").exists() and args.recover:
                         log(f"model {model}: recovery")
-                        train._recover_from_run_root(run_root)
+                        recover_training_artifacts(run_root_path)
                         recovery_used = True
-                        validation_errors = validate_artifacts(run_root)
+                        validation_errors = validate_artifacts(run_root_path)
                         if validation_errors:
                             error = "; ".join(validation_errors)
                 if error:
@@ -472,7 +462,7 @@ def run_suite(args: argparse.Namespace) -> int:
                         {
                             **summarize_run(
                                 cfg,
-                                run_root,
+                                run_root_path,
                                 status="failed",
                                 recovery_used=recovery_used,
                                 error=error,
@@ -482,7 +472,9 @@ def run_suite(args: argparse.Namespace) -> int:
                     )
                     continue
                 summaries.append(
-                    summarize_run(cfg, run_root, status="completed", recovery_used=recovery_used)
+                    summarize_run(
+                        cfg, run_root_path, status="completed", recovery_used=recovery_used
+                    )
                 )
             else:
                 if error:
@@ -492,7 +484,7 @@ def run_suite(args: argparse.Namespace) -> int:
                         {
                             **summarize_run(
                                 cfg,
-                                run_root,
+                                run_root_path,
                                 status="failed",
                                 recovery_used=recovery_used,
                                 error=error,

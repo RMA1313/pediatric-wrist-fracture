@@ -20,6 +20,7 @@ from wrist_fracture.provenance import (
     sha256_file,
     to_jsonable,
 )
+from wrist_fracture.runtime import normalize_device, normalize_json_value
 
 SCHEMA_VERSION = 1
 MODEL_ORDER = ("yolov8", "yolov9", "yolo26")
@@ -94,9 +95,7 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def _json_safe(value: Any) -> Any:
-    from scripts.train import _normalize_json_value
-
-    return _normalize_json_value(value)
+    return normalize_json_value(value)
 
 
 def _to_float(value: Any) -> float | None:
@@ -271,7 +270,6 @@ def evaluate_checkpoint(
     out_dir: Path,
     allow_test: bool = False,
 ) -> dict[str, Any]:
-    from scripts.train import _normalize_device
     from ultralytics import YOLO
 
     if not execute:
@@ -335,7 +333,7 @@ def evaluate_checkpoint(
         imgsz=cfg.image_size,
         batch=cfg.batch_size,
         workers=cfg.hardware.workers,
-        device=_normalize_device(cfg.hardware.device),
+        device=normalize_device(cfg.hardware.device),
         amp=cfg.hardware.amp,
         conf=resolved["conf"],
         iou=resolved["iou"],
