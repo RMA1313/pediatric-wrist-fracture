@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+from scripts import prepare_dataset
 from scripts.prepare_dataset import build_records, validate_split
 
 from wrist_fracture.data.preparation import (
@@ -168,3 +170,83 @@ def test_inspect_worker_exception_surfaces(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr("scripts.prepare_dataset._inspect_image_worker", boom)
     with pytest.raises(RuntimeError, match="inspect-images failed"):
         build_records(raw, workers=2, batch_size=1, progress=False, force=True)
+
+
+def _write_yolo_dataset(root: Path) -> Path:
+    yolo = root / "data" / "processed" / "yolo"
+    for split in ("train", "val", "test"):
+        (yolo / "images" / split).mkdir(parents=True, exist_ok=True)
+        (yolo / "labels" / split).mkdir(parents=True, exist_ok=True)
+    cases = {
+        "train": [
+            ("train_neg", []),
+            (
+                "train_multi",
+                ["0 0.500000 0.500000 0.250000 0.250000", "0 0.250000 0.250000 0.100000 0.100000"],
+            ),
+        ],
+        "val": [("val_pos", ["0 0.500000 0.500000 0.200000 0.200000"])],
+        "test": [("test_neg", [])],
+    }
+    for split, rows in cases.items():
+        for stem, lines in rows:
+            img = np.full((48, 64, 3), 255, dtype=np.uint8)
+            cv2.imwrite(str(yolo / "images" / split / f"{stem}.png"), img)
+            (yolo / "labels" / split / f"{stem}.txt").write_text(
+                "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
+            )
+    (yolo / "dataset.yaml").write_text(
+        textwrap.dedent(
+            f"""
+            path: {yolo.as_posix()}
+            train: images/train
+            val: images/val
+            test: images/test
+            names:
+              0: fracture
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return yolo
+
+
+def test_smoke_loader_uses_dataset_yaml_and_splits(tmp_path: Path):
+    yolo = _write_yolo_dataset(tmp_path)
+    report = prepare_dataset.smoke_load_dataset(yolo, max_batches=2, batch_size=1, workers=0)
+    assert report["dataset_yaml"].endswith("dataset.yaml")
+    assert set(report["splits"]) == {"train", "val", "test"}
+    assert report["splits"]["train"]["loaded_batches"] == 2
+    assert report["splits"]["train"]["negative_samples"] >= 1
+    assert report["splits"]["train"]["multi_box_samples"] >= 1
+    assert report["splits"]["val"]["loaded_batches"] == 1
+    assert report["splits"]["test"]["loaded_batches"] == 1
+    assert report["splits"]["train"]["images_loaded"] > 0
+    assert report["splits"]["train"]["labels_loaded"] >= 0
+
+
+def test_smoke_loader_bounded_batches(tmp_path: Path):
+    yolo = _write_yolo_dataset(tmp_path)
+    report = prepare_dataset.smoke_load_dataset(yolo, max_batches=1, batch_size=1, workers=0)
+    assert report["splits"]["train"]["loaded_batches"] == 1
+    assert len(report["splits"]["train"]["batches"]) == 1
+
+
+def test_smoke_loader_missing_dataset_yaml_fails(tmp_path: Path):
+    yolo = tmp_path / "data" / "processed" / "yolo"
+    yolo.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(FileNotFoundError, match="Dataset YAML not found"):
+        prepare_dataset.smoke_load_dataset(yolo, max_batches=1, batch_size=1, workers=0)
+
+
+def test_smoke_loader_invalid_path_fails(tmp_path: Path):
+    with pytest.raises(FileNotFoundError, match="Dataset YAML not found"):
+        prepare_dataset.smoke_load_dataset(
+            tmp_path / "missing", max_batches=1, batch_size=1, workers=0
+        )
+
+
+def test_smoke_loader_has_no_model_data_dependency():
+    source = Path(prepare_dataset.__file__).read_text(encoding="utf-8")
+    assert "model.data" not in source

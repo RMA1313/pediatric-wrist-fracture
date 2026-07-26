@@ -113,10 +113,7 @@ def json_ready(value: Any, base_dir: Path | None = None) -> Any:
     if dataclass_isinstance(value):
         return json_ready(dataclass_to_dict(value), base_dir=base_dir)
     if isinstance(value, dict):
-        return {
-            str(key): json_ready(item, base_dir=base_dir)
-            for key, item in value.items()
-        }
+        return {str(key): json_ready(item, base_dir=base_dir) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [json_ready(item, base_dir=base_dir) for item in value]
     if isinstance(value, set):

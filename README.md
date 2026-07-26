@@ -13,7 +13,7 @@ It must not be treated as a clinical system, medical device, treatment recommend
 
 ## Current phase
 
-Phase 1 is complete in scope only for environment auditing, source verification, reproducible scaffolding, and dataset metadata tooling.
+Phase 2 is focused on dataset preparation, auditability, and repository cleanup.
 No full model training has been started.
 
 ## Planned models
@@ -50,14 +50,12 @@ See `docs/decisions.md` and the directory tree in this repository.
 
 ## Next phases
 
-1. Inspect dataset metadata and directory layout.
-2. Finalize exact YOLOv8/YOLOv9/YOLO26 implementation choices.
-3. Implement dataset preparation and split generation.
-4. Start controlled fine-tuning experiments.
+1. Run controlled model training only after the final dataset audit passes.
+2. Evaluate the held-out test split with the finalized experiment protocol.
+3. Compare model families under the same data and validation conditions.
 
 ## Known limitations
 
 - No training has been run yet.
 - Dataset download is intentionally conservative until storage and metadata are verified.
 - Some implementation details are intentionally left unresolved pending source verification.
-

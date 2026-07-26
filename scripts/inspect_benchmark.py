@@ -4,9 +4,9 @@ import argparse
 import csv
 import json
 import shutil
+import sys
 import tempfile
 import time
-import sys
 from pathlib import Path
 
 import cv2
@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from scripts.prepare_dataset import build_records
+from scripts.prepare_dataset import build_records  # noqa: E402
 
 
 def _write_dataset(root: Path, count: int = 60) -> Path:
@@ -61,7 +61,10 @@ def _write_real_subset(root: Path, source_raw: Path, count: int) -> Path:
     else:
         extracted_source = source_raw / "extracted"
         stems = sorted({p.stem for p in extracted_source.rglob("*.png")})[:count]
-        rows = [{"filestem": stem, "patient_id": str(i // 3), "study_id": str(i)} for i, stem in enumerate(stems)]
+        rows = [
+            {"filestem": stem, "patient_id": str(i // 3), "study_id": str(i)}
+            for i, stem in enumerate(stems)
+        ]
     out_rows = ["filestem,patient_id,study_id"]
     source_extracted = source_raw / "extracted"
     for row in rows:
@@ -72,7 +75,7 @@ def _write_real_subset(root: Path, source_raw: Path, count: int) -> Path:
             matches = sorted(source_extracted.rglob(f"{stem}{suffix}"))
             if matches:
                 shutil.copy2(matches[0], extracted / matches[0].name)
-        out_rows.append(f"{stem},{row.get('patient_id','')},{row.get('study_id','')}")
+        out_rows.append(f"{stem},{row.get('patient_id', '')},{row.get('study_id', '')}")
     (archives / "dataset.csv").write_text("\n".join(out_rows) + "\n", encoding="utf-8")
     (archives / "folder_structure.zip").write_text("", encoding="utf-8")
     return raw
@@ -95,7 +98,9 @@ def run() -> None:
         results = []
         for workers in (1, 8):
             t0 = time.perf_counter()
-            records, summary = build_records(raw, workers=workers, batch_size=8, progress=False, force=True)
+            records, summary = build_records(
+                raw, workers=workers, batch_size=8, progress=False, force=True
+            )
             elapsed = time.perf_counter() - t0
             results.append(
                 {
@@ -109,7 +114,17 @@ def run() -> None:
         serial, parallel = results
         serial_t = serial["elapsed_s"]
         parallel_t = parallel["elapsed_s"]
-        print(json.dumps({"serial": serial, "parallel": parallel, "speedup": round(serial_t / parallel_t, 2)}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "serial": serial,
+                    "parallel": parallel,
+                    "speedup": round(serial_t / parallel_t, 2),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import yaml
 from tqdm import tqdm
 
@@ -980,6 +981,208 @@ def write_dataset_yaml(processed_dir: Path) -> Path:
     return yaml_path
 
 
+def _load_ultralytics_detection_api() -> tuple[Any, Any, Any]:
+    try:
+        from ultralytics.data.build import build_dataloader, build_yolo_dataset
+        from ultralytics.data.utils import check_det_dataset
+    except Exception as exc:  # pragma: no cover - dependency/version failure
+        raise RuntimeError(
+            "Ultralytics detection dataset APIs are unavailable. "
+            "Expected ultralytics.data.utils.check_det_dataset and "
+            "ultralytics.data.build.build_yolo_dataset/build_dataloader."
+        ) from exc
+    return check_det_dataset, build_yolo_dataset, build_dataloader
+
+
+def _resolve_dataset_yaml(yolo_dir: Path) -> Path:
+    yaml_path = yolo_dir / "dataset.yaml"
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Dataset YAML not found: {yaml_path}")
+    return yaml_path
+
+
+def _read_dataset_names(data: dict[str, Any]) -> dict[int, str]:
+    names = data.get("names")
+    if isinstance(names, dict):
+        return {int(k): str(v) for k, v in names.items()}
+    if isinstance(names, list):
+        return {idx: str(name) for idx, name in enumerate(names)}
+    raise ValueError("dataset.yaml must define 'names' as a list or mapping")
+
+
+def _batch_boxes(batch: dict[str, Any]) -> tuple[np.ndarray, np.ndarray] | None:
+    boxes = batch.get("bboxes")
+    cls = batch.get("cls")
+    if boxes is None or cls is None:
+        return None
+    boxes_arr = boxes.detach().cpu().numpy() if hasattr(boxes, "detach") else np.asarray(boxes)
+    cls_arr = (
+        cls.detach().cpu().numpy().reshape(-1)
+        if hasattr(cls, "detach")
+        else np.asarray(cls).reshape(-1)
+    )
+    return boxes_arr, cls_arr
+
+
+def smoke_load_dataset(
+    yolo_dir: Path,
+    max_batches: int = 2,
+    batch_size: int = 2,
+    workers: int | None = None,
+) -> dict[str, Any]:
+    from ultralytics.cfg import get_cfg
+
+    check_det_dataset, build_yolo_dataset, build_dataloader = _load_ultralytics_detection_api()
+    yaml_path = _resolve_dataset_yaml(yolo_dir)
+    start = _now()
+    data = check_det_dataset(str(yaml_path), autodownload=False)
+    dataset_yaml = Path(data.get("yaml_file", yaml_path))
+    names = _read_dataset_names(data)
+    version = __import__("ultralytics").__version__
+    worker_count = _default_workers() if workers is None else max(0, int(workers))
+    split_stats: dict[str, Any] = {
+        "ultralytics_version": version,
+        "dataset_yaml": str(dataset_yaml),
+        "resolved_dataset_yaml": str(dataset_yaml.resolve()),
+        "max_batches": int(max_batches),
+        "batch_size": int(batch_size),
+        "workers": worker_count,
+        "splits": {},
+    }
+    for split in ("train", "val", "test"):
+        split_path = data.get(split)
+        if not split_path:
+            raise FileNotFoundError(f"{yaml_path} is missing a usable '{split}' split")
+        split_start = _now()
+        dataset = build_yolo_dataset(
+            cfg=get_cfg(
+                overrides={
+                    "task": "detect",
+                    "imgsz": 64,
+                    "rect": False,
+                    "cache": False,
+                    "single_cls": False,
+                    "fraction": 1.0,
+                    "classes": None,
+                }
+            ),
+            img_path=str(split_path),
+            batch=max(1, int(batch_size)),
+            data=data,
+            mode=split,
+            rect=False,
+            stride=32,
+            multi_modal=False,
+            fraction=1.0,
+        )
+        labels = dataset.get_labels()
+        label_files = getattr(dataset, "label_files", [])
+        cache_path = Path(label_files[0]).parent.with_suffix(".cache") if label_files else None
+        cache_created_at = (
+            cache_path.stat().st_mtime_ns if cache_path and cache_path.exists() else None
+        )
+        loader = build_dataloader(
+            dataset=dataset,
+            batch=max(1, int(batch_size)),
+            workers=worker_count,
+            shuffle=False,
+            rank=-1,
+            drop_last=False,
+            pin_memory=False,
+        )
+        split_info: dict[str, Any] = {
+            "image_path": str(split_path),
+            "image_count": len(labels),
+            "label_count": len(label_files),
+            "initialization_seconds": round(_now() - split_start, 6),
+            "cache_created_at_ns": cache_created_at,
+            "batches": [],
+            "negative_samples": 0,
+            "multi_box_samples": 0,
+        }
+        loader_iter = iter(loader)
+        for batch_idx in range(max_batches):
+            batch_start = _now()
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                break
+            boxes = _batch_boxes(batch)
+            images = batch.get("img")
+            if images is None:
+                raise RuntimeError(f"Ultralytics batch for split '{split}' did not include 'img'")
+            image_shape = tuple(int(x) for x in getattr(images, "shape", ()))
+            if len(image_shape) < 3:
+                raise RuntimeError(
+                    f"Unexpected image tensor shape for split '{split}': {image_shape}"
+                )
+            if hasattr(images, "dtype"):
+                _ = images.dtype
+            if boxes is not None:
+                boxes_arr, cls_arr = boxes
+                if boxes_arr.size:
+                    if not np.isfinite(boxes_arr).all():
+                        raise ValueError(
+                            f"Non-finite boxes found in split '{split}' batch {batch_idx}"
+                        )
+                    if np.any((boxes_arr < 0) | (boxes_arr > 1)):
+                        raise ValueError(
+                            f"Normalized boxes out of range in split '{split}' batch {batch_idx}"
+                        )
+                    if np.any(cls_arr < 0) or np.any(cls_arr >= len(names)):
+                        raise ValueError(
+                            f"Negative class ids found in split '{split}' batch {batch_idx}"
+                        )
+            if "im_file" in batch:
+                batch_files = batch["im_file"]
+                if isinstance(batch_files, (list, tuple)):
+                    batch_sample_count = len(batch_files)
+                else:
+                    batch_sample_count = (
+                        int(getattr(batch_files, "shape", [0])[0])
+                        if getattr(batch_files, "shape", None)
+                        else 0
+                    )
+            else:
+                batch_sample_count = int(image_shape[0])
+            label_slice = dataset.labels[
+                batch_idx * max(1, batch_size) : batch_idx * max(1, batch_size) + batch_sample_count
+            ]
+            for item in label_slice:
+                nboxes = len(item.get("cls", []))
+                if nboxes == 0:
+                    split_info["negative_samples"] += 1
+                elif nboxes > 1:
+                    split_info["multi_box_samples"] += 1
+            elapsed = round(_now() - batch_start, 6)
+            if "first_batch_seconds" not in split_info:
+                split_info["first_batch_seconds"] = elapsed
+            else:
+                split_info.setdefault("subsequent_batch_seconds", elapsed)
+            split_info["batches"].append(
+                {
+                    "batch_index": batch_idx,
+                    "images": int(image_shape[0]),
+                    "shape": list(image_shape),
+                    "labels": int(len(batch.get("cls", []))) if batch.get("cls") is not None else 0,
+                    "boxes": int(boxes[0].shape[0]) if boxes is not None else 0,
+                }
+            )
+            if batch_idx + 1 >= max_batches:
+                break
+        if "first_batch_seconds" not in split_info:
+            split_info["first_batch_seconds"] = None
+        if "subsequent_batch_seconds" not in split_info:
+            split_info["subsequent_batch_seconds"] = None
+        split_info["loaded_batches"] = len(split_info["batches"])
+        split_info["images_loaded"] = int(sum(b["images"] for b in split_info["batches"]))
+        split_info["labels_loaded"] = int(sum(b["labels"] for b in split_info["batches"]))
+        split_info["load_seconds"] = round(_now() - split_start, 6)
+        split_stats["splits"][split] = split_info
+    split_stats["total_seconds"] = round(_now() - start, 6)
+    return split_stats
+
+
 def build_final_dataset(
     records: list[ImageRecord],
     processed_dir: Path,
@@ -1027,19 +1230,6 @@ def build_final_dataset(
     )
     write_dataset_yaml(yolo_dir)
     return yolo_dir
-
-
-def smoke_load_dataset(yolo_dir: Path, max_batches: int = 2) -> dict[str, Any]:
-    from ultralytics import YOLO
-
-    model = YOLO("yolov8n.pt")
-    data = model.data
-    return {
-        "dataset_yaml": str(yolo_dir / "dataset.yaml"),
-        "model_loaded": bool(model),
-        "data_keys": sorted(list(data.keys())) if isinstance(data, dict) else [],
-        "max_batches": max_batches,
-    }
 
 
 def summarize(records: list[ImageRecord], comparison: dict[str, Any]) -> dict[str, Any]:
@@ -1367,7 +1557,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("smoke")
     s.add_argument("--processed-dir", type=Path, default=get_paths().processed)
     s.add_argument(
-        "--smoke-report", type=Path, default=get_paths().dataset_reports / "smoke_report.json"
+        "--smoke-report",
+        type=Path,
+        default=get_paths().dataset_reports / "loader_smoke_report.json",
     )
     s.add_argument("--max-batches", type=int, default=2)
     s.set_defaults(func=cmd_smoke)

@@ -12,3 +12,6 @@ Planned structure:
 
 Large images, annotations, caches, and derived training artifacts should stay outside version control.
 
+For this project, the processed YOLO dataset is materialized under
+`data/processed/yolo/` using hard links when the filesystem supports them.
+Split manifests are stored in `data/splits/` as CSV files.
