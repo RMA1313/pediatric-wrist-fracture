@@ -237,12 +237,26 @@ def load_config_bundle(
     run_path: str | Path | None = None,
 ) -> ExperimentConfig:
     payload = load_yaml_config(experiment_path)
+    experiment = _require_mapping(payload.get("experiment"), "experiment")
     for extra_path in [model_path, hardware_path, run_path]:
         if extra_path:
-            payload = _deep_merge(payload, load_yaml_config(extra_path))
+            extra = load_yaml_config(extra_path)
+            if "experiment" in extra:
+                experiment = _deep_merge(
+                    experiment,
+                    _require_mapping(extra["experiment"], str(extra_path)),
+                )
+            else:
+                for section in ("model", "hardware", "run"):
+                    if section in extra:
+                        experiment[section] = _deep_merge(
+                            _require_mapping(experiment.get(section), f"experiment.{section}"),
+                            _require_mapping(extra[section], f"{extra_path}.{section}"),
+                        )
     if "experiment" not in payload:
         raise ConfigError("experiment section is missing")
-    return _coerce_exp(_require_mapping(payload["experiment"], "experiment"))
+    payload["experiment"] = experiment
+    return _coerce_exp(experiment)
 
 
 def config_to_dict(cfg: ExperimentConfig) -> dict[str, Any]:
@@ -258,7 +272,6 @@ def validate_experiment_config(
     cfg: ExperimentConfig,
     *,
     dry_run: bool = False,
-    gpu_ready: bool = True,
     allow_cpu_smoke: bool = False,
 ) -> list[str]:
     errors: list[str] = []
@@ -276,8 +289,6 @@ def validate_experiment_config(
         errors.append("invalid batch size")
     if cfg.hardware.workers < 0:
         errors.append("workers must be non-negative")
-    if cfg.hardware.device.startswith("cuda") and not gpu_ready:
-        errors.append("incompatible GPU execution on this machine")
     if cfg.hardware.device == "cpu" and cfg.hardware.require_gpu:
         errors.append("incompatible CPU/GPU execution: GPU required")
     if (
@@ -306,6 +317,27 @@ def validate_experiment_config(
         errors.append("unknown checkpoint or unsupported external repo model")
     if dry_run and cfg.run.repeated_runs <= 0:
         errors.append("repeated_runs must be positive")
-    if not gpu_ready and cfg.hardware.device.startswith("cuda"):
-        errors.append("CUDA device unavailable")
     return errors
+
+
+def describe_config_composition(
+    experiment_path: str | Path,
+    *,
+    model_path: str | Path | None = None,
+    hardware_path: str | Path | None = None,
+    run_path: str | Path | None = None,
+) -> dict[str, Any]:
+    base = load_yaml_config(experiment_path)
+    composed = {
+        "base": base,
+        "resolved": load_config_bundle(
+            experiment_path,
+            model_path=model_path,
+            hardware_path=hardware_path,
+            run_path=run_path,
+        ),
+    }
+    return {
+        "base": base,
+        "resolved": config_to_dict(composed["resolved"]),
+    }

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
-import csv
 from pathlib import Path
 
 from wrist_fracture.provenance import dependency_lock_hash, git_commit, git_dirty, sha256_file

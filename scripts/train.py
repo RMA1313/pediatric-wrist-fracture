@@ -109,6 +109,40 @@ def dry_plan(cfg: ExperimentConfig, run_id: str) -> dict[str, object]:
     }
 
 
+def _cuda_is_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _cuda_device_exists(device: str) -> bool:
+    if not device.startswith("cuda"):
+        return True
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        if device == "cuda":
+            return torch.cuda.device_count() > 0
+        if ":" in device:
+            index = int(device.split(":", 1)[1])
+        else:
+            index = 0
+        return index < torch.cuda.device_count()
+    except Exception:
+        return False
+
+
+def _execute_training(cfg: ExperimentConfig, root: Path) -> None:
+    raise NotImplementedError(
+        "Training execution is wired but intentionally not run in this phase."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/experiment.yaml")
@@ -121,6 +155,7 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--allow-cpu-smoke", action="store_true")
+    parser.add_argument("--print-resolved-config", action="store_true")
     args = parser.parse_args()
 
     cfg = resolve_config(args)
@@ -148,10 +183,12 @@ def main() -> None:
         )
     if not args.execute and not (args.preflight or args.dry_run):
         raise ConfigError("full training requires explicit --execute")
+    gpu_ready = _cuda_is_available() if args.execute else None
+    if args.print_resolved_config:
+        print(json.dumps(config_to_dict(cfg), indent=2, sort_keys=True))
     errors = validate_experiment_config(
         cfg,
         dry_run=not args.execute,
-        gpu_ready=False,
         allow_cpu_smoke=args.allow_cpu_smoke and args.smoke,
     )
     if errors:
@@ -161,14 +198,17 @@ def main() -> None:
     if args.resume and not root.exists():
         raise ConfigError("resume requested but run directory does not exist")
     ensure_unique_run_dir(root, resume=args.resume)
+    if cfg.hardware.device.startswith("cuda") and args.execute:
+        if not gpu_ready:
+            raise ConfigError("torch.cuda.is_available() is false")
+        if not _cuda_device_exists(cfg.hardware.device):
+            raise ConfigError("requested CUDA device does not exist")
     if args.preflight or args.dry_run or not args.execute:
         print(json.dumps(dry_plan(cfg, run_id), indent=2, sort_keys=True))
         return
     persist_run_metadata(root, cfg, args)
     try:
-        raise NotImplementedError(
-            "Training execution is wired but intentionally not run in this phase."
-        )
+        _execute_training(cfg, root)
     except Exception:
         finalize_run(root, success=False)
         raise
