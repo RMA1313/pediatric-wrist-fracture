@@ -1,54 +1,90 @@
 PYTHON ?= python
 
 .PHONY: setup audit test lint format \
+	experiment-check experiment-validate \
+	train-dry-run-yolov8n train-dry-run-yolov9t train-dry-run-yolo26n \
+	evaluate-dry-run benchmark-dry-run gpu-preflight transfer-manifest transfer-verify \
 	dataset-info dataset-download dataset-verify dataset-extract \
 	dataset-inspect dataset-convert dataset-split dataset-validate \
 	dataset-figures dataset-smoke dataset-prepare
 
 setup:
-\tuv sync
+	uv sync
 
 audit:
-\tuv run python scripts/audit_environment.py
+	uv run python scripts/audit_environment.py
 
 test:
-\tuv run pytest
+	uv run pytest
 
 lint:
-\tuv run ruff check .
+	uv run ruff check .
 
 format:
-\tuv run ruff format .
+	uv run ruff format .
+
+experiment-check:
+	uv run python scripts/train.py --config configs/experiment.yaml --dry-run
+
+experiment-validate:
+	uv run python scripts/train.py --config configs/experiment.yaml --preflight
+
+train-dry-run-yolov8n:
+	uv run python scripts/train.py --config configs/experiment.yaml --model-config configs/models/yolov8.yaml --hardware-config configs/hardware/cpu-dev.yaml --run-config configs/runs/smoke.yaml --dry-run --smoke
+
+train-dry-run-yolov9t:
+	uv run python scripts/train.py --config configs/experiment.yaml --model-config configs/models/yolov9.yaml --hardware-config configs/hardware/cpu-dev.yaml --run-config configs/runs/smoke.yaml --dry-run --smoke
+
+train-dry-run-yolo26n:
+	uv run python scripts/train.py --config configs/experiment.yaml --model-config configs/models/yolo26.yaml --hardware-config configs/hardware/cpu-dev.yaml --run-config configs/runs/smoke.yaml --dry-run --smoke
+
+train-dry-run:
+	uv run python scripts/train.py --config configs/experiment.yaml --dry-run
+
+evaluate-dry-run:
+	uv run python scripts/evaluate.py --config configs/experiment.yaml --checkpoint data/processed/yolo/dataset.yaml --dry-run
+
+benchmark-dry-run:
+	uv run python scripts/benchmark.py --config configs/experiment.yaml --checkpoint data/processed/yolo/dataset.yaml --dry-run
+
+gpu-preflight:
+	uv run python scripts/gpu_preflight.py
+
+transfer-manifest:
+	uv run python scripts/transfer_manifest.py
+
+transfer-verify:
+	uv run python scripts/transfer_manifest.py --verify
 
 dataset-info:
-\tuv run python scripts/download_dataset.py --metadata-only
+	uv run python scripts/download_dataset.py --metadata-only
 
 dataset-download:
-\tuv run python scripts/prepare_dataset.py download
+	uv run python scripts/prepare_dataset.py download
 
 dataset-verify:
-\tuv run python scripts/download_dataset.py --metadata-only
+	uv run python scripts/download_dataset.py --metadata-only
 
 dataset-extract:
-\tuv run python scripts/prepare_dataset.py extract
+	uv run python scripts/prepare_dataset.py extract
 
 dataset-inspect:
-\tuv run python scripts/prepare_dataset.py inspect --progress
+	uv run python scripts/prepare_dataset.py inspect --progress
 
 dataset-convert:
-\tuv run python scripts/prepare_dataset.py convert --workers 8 --io-workers 16 --batch-size 32 --progress
+	uv run python scripts/prepare_dataset.py convert --workers 8 --io-workers 16 --batch-size 32 --progress
 
 dataset-split:
-\tuv run python scripts/prepare_dataset.py split
+	uv run python scripts/prepare_dataset.py split
 
 dataset-validate:
-\tuv run python scripts/prepare_dataset.py validate --io-workers 16 --batch-size 64 --progress
+	uv run python scripts/prepare_dataset.py validate --io-workers 16 --batch-size 64 --progress
 
 dataset-figures:
-\tuv run python scripts/prepare_dataset.py figures --progress
+	uv run python scripts/prepare_dataset.py figures --progress
 
 dataset-smoke:
-\tuv run python scripts/prepare_dataset.py smoke --max-batches 2
+	uv run python scripts/prepare_dataset.py smoke --max-batches 2
 
 dataset-prepare:
-\tuv run python scripts/prepare_dataset.py prepare
+	uv run python scripts/prepare_dataset.py prepare

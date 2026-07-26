@@ -1,23 +1,21 @@
 # References
 
-Verified primary sources used for implementation decisions.
-
 ## Dataset
 
-- Nagy E, Janisch M, Hržić F, Sorantin E, Tschauner S, et al. *A pediatric wrist trauma X-ray dataset (GRAZPEDWRI-DX) for machine learning.* Scientific Data. 2022;9:222. DOI: [10.1038/s41597-022-01328-z](https://doi.org/10.1038/s41597-022-01328-z)
-- GRAZPEDWRI-DX Figshare record: [10.6084/m9.figshare.14825193.v2](https://doi.org/10.6084/m9.figshare.14825193.v2)
+- GRAZPEDWRI-DX Figshare record: https://doi.org/10.6084/m9.figshare.14825193.v2
+- Scientific Data article for the dataset: https://doi.org/10.1038/s41597-022-01328-z
 
-## Prior wrist fracture studies
+## Ultralytics
 
-- Ju R-Y, Cai W. *Fracture detection in pediatric wrist trauma X-ray images using YOLOv8 algorithm.* Scientific Reports. 2023. DOI: [10.1038/s41598-023-47460-7](https://doi.org/10.1038/s41598-023-47460-7)
-- Chien C-T, Ju R-Y, Chou K-Y, Chiang J-S. *YOLOv9 for fracture detection in pediatric wrist trauma X-ray images.* Electronics Letters. 2024. DOI: [10.1049/ell2.13248](https://doi.org/10.1049/ell2.13248)
+- Python usage overview: https://docs.ultralytics.com/usage/python
+- Training / validation / benchmarking modes: https://docs.ultralytics.com/modes/
+- Model API reference: https://docs.ultralytics.com/reference/engine/model
 
-## YOLO26
+## PyTorch
 
-- Jocher G, Qiu J, Liu M, Lyu S, Akyon FC, Kalfaoglu ME. *Ultralytics YOLO26: Unified Real-Time End-to-End Vision Models.* arXiv:2606.03748. DOI: [10.48550/arXiv.2606.03748](https://doi.org/10.48550/arXiv.2606.03748)
-- Ultralytics YOLO26 documentation: <https://docs.ultralytics.com/models/yolo26/>
+- Official local install selector: https://pytorch.org/get-started/locally/
 
 ## Notes
 
-- YOLOv9 implementation details remain unresolved until the final official base implementation is verified against primary sources.
-
+- CUDA wheel selection should always be re-checked on the GPU machine against the official PyTorch install selector before installation.
+- This repository intentionally avoids hard-coding a permanent CUDA wheel version in the codebase.

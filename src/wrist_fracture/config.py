@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,90 @@ class ConfigError(ValueError):
     pass
 
 
+MODEL_FAMILIES = {"yolov8", "yolov9", "yolo26"}
+SPLITS = {"train", "val", "test"}
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    family: str
+    checkpoint: str
+    scale: str
+    task: str = "detect"
+    implementation: str = "ultralytics"
+    supports_training: bool = True
+    requires_external_repo: bool = False
+    nms_free_default: bool = False
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.family == other
+        if not isinstance(other, ModelConfig):
+            return NotImplemented
+        return asdict(self) == asdict(other)
+
+
+@dataclass(frozen=True)
+class HardwareConfig:
+    device: str = "cpu"
+    amp: bool = False
+    workers: int = 0
+    cache: str = "ram"
+    deterministic: bool = True
+    allow_cpu_training: bool = False
+    require_gpu: bool = False
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    name: str
+    output_root: Path
+    run_id: str | None = None
+    resume: bool = False
+    save_period: int = 1
+    validation_split: str = "val"
+    test_split: str = "test"
+    allow_test_evaluation: bool = False
+    selection_metric: str = "metrics/mAP50-95(B)"
+    repeated_runs: int = 1
+    batch_size_policy: str = "fixed"
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    dataset_yaml: Path
+    dataset_split_yaml: Path | None
+    model: ModelConfig
+    hardware: HardwareConfig
+    run: RunConfig
+    image_size: int = 640
+    epochs: int = 100
+    patience: int = 20
+    seed: int = 42
+    pretrained: bool = True
+    optimizer: str = "auto"
+    lr0: float = 0.01
+    lrf: float = 0.01
+    weight_decay: float = 0.0005
+    augmentation: dict[str, Any] = field(default_factory=dict)
+    resume_checkpoint: Path | None = None
+    save_json: bool = True
+    batch_size: int = 1
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def train_ratio(self) -> float:
+        return 0.7
+
+    @property
+    def val_ratio(self) -> float:
+        return 0.15
+
+    @property
+    def test_ratio(self) -> float:
+        return 0.15
+
+
 @dataclass(frozen=True)
 class ProjectConfig:
     name: str
@@ -18,31 +103,6 @@ class ProjectConfig:
     output_dir: Path
     data_dir: Path
     log_level: str = "INFO"
-
-
-@dataclass(frozen=True)
-class DatasetConfig:
-    source: str
-    figshare_doi: str
-    expected_root: Path
-    raw_dir: Path
-    interim_dir: Path
-    processed_dir: Path
-    splits_dir: Path
-    dry_run: bool = True
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    model: str
-    checkpoint: str | None
-    image_size: int
-    batch_size: int
-    epochs: int
-    device: str
-    train_ratio: float
-    val_ratio: float
-    test_ratio: float
 
 
 def _require_mapping(value: Any, source: str) -> dict[str, Any]:
@@ -59,6 +119,93 @@ def load_yaml_config(path: str | Path) -> dict[str, Any]:
     return _require_mapping(data, str(config_path))
 
 
+def _coerce_exp(exp: dict[str, Any]) -> ExperimentConfig:
+    model = _require_mapping(exp["model"], "experiment.model")
+    hardware = _require_mapping(exp["hardware"], "experiment.hardware")
+    run = _require_mapping(exp["run"], "experiment.run")
+    dataset = _require_mapping(exp["dataset"], "experiment.dataset")
+    return ExperimentConfig(
+        dataset_yaml=Path(dataset["yaml"]),
+        dataset_split_yaml=Path(dataset["split_yaml"]) if dataset.get("split_yaml") else None,
+        model=ModelConfig(
+            family=str(model["family"]),
+            checkpoint=str(model["checkpoint"]),
+            scale=str(model["scale"]),
+            task=str(model.get("task", "detect")),
+            implementation=str(model.get("implementation", "ultralytics")),
+            supports_training=bool(model.get("supports_training", True)),
+            requires_external_repo=bool(model.get("requires_external_repo", False)),
+            nms_free_default=bool(model.get("nms_free_default", False)),
+        ),
+        hardware=HardwareConfig(
+            device=str(hardware.get("device", "cpu")),
+            amp=bool(hardware.get("amp", False)),
+            workers=int(hardware.get("workers", 0)),
+            cache=str(hardware.get("cache", "ram")),
+            deterministic=bool(hardware.get("deterministic", True)),
+            allow_cpu_training=bool(hardware.get("allow_cpu_training", False)),
+            require_gpu=bool(hardware.get("require_gpu", False)),
+        ),
+        run=RunConfig(
+            name=str(run["name"]),
+            output_root=Path(run["output_root"]),
+            run_id=str(run.get("run_id")) if run.get("run_id") else None,
+            resume=bool(run.get("resume", False)),
+            save_period=int(run.get("save_period", 1)),
+            validation_split=str(run.get("validation_split", "val")),
+            test_split=str(run.get("test_split", "test")),
+            allow_test_evaluation=bool(run.get("allow_test_evaluation", False)),
+            selection_metric=str(run.get("selection_metric", "metrics/mAP50-95(B)")),
+            repeated_runs=int(run.get("repeated_runs", 1)),
+            batch_size_policy=str(run.get("batch_size_policy", "fixed")),
+        ),
+        image_size=int(exp.get("image_size", 640)),
+        epochs=int(exp.get("epochs", 100)),
+        patience=int(exp.get("patience", 20)),
+        seed=int(exp.get("seed", 42)),
+        pretrained=bool(exp.get("pretrained", True)),
+        optimizer=str(exp.get("optimizer", "auto")),
+        lr0=float(exp.get("lr0", 0.01)),
+        lrf=float(exp.get("lrf", 0.01)),
+        weight_decay=float(exp.get("weight_decay", 0.0005)),
+        augmentation=dict(exp.get("augmentation", {})),
+        resume_checkpoint=Path(exp["resume_checkpoint"]) if exp.get("resume_checkpoint") else None,
+        save_json=bool(exp.get("save_json", True)),
+        batch_size=int(exp.get("batch_size", 1)),
+        extra={
+            k: v
+            for k, v in exp.items()
+            if k
+            not in {
+                "dataset",
+                "model",
+                "hardware",
+                "run",
+                "image_size",
+                "epochs",
+                "patience",
+                "seed",
+                "pretrained",
+                "optimizer",
+                "lr0",
+                "lrf",
+                "weight_decay",
+                "augmentation",
+                "resume_checkpoint",
+                "save_json",
+                "batch_size",
+            }
+        },
+    )
+
+
+def load_experiment_config(path: str | Path) -> ExperimentConfig:
+    data = load_yaml_config(path)
+    if "experiment" not in data:
+        raise ConfigError("experiment section is missing")
+    return _coerce_exp(_require_mapping(data["experiment"], "experiment"))
+
+
 def load_project_config(path: str | Path) -> ProjectConfig:
     data = load_yaml_config(path).get("project")
     if not isinstance(data, dict):
@@ -72,34 +219,93 @@ def load_project_config(path: str | Path) -> ProjectConfig:
     )
 
 
-def load_dataset_config(path: str | Path) -> DatasetConfig:
-    data = load_yaml_config(path).get("dataset")
-    if not isinstance(data, dict):
-        raise ConfigError("dataset section is missing or invalid")
-    return DatasetConfig(
-        source=str(data["source"]),
-        figshare_doi=str(data["figshare_doi"]),
-        expected_root=Path(data["expected_root"]),
-        raw_dir=Path(data["raw_dir"]),
-        interim_dir=Path(data["interim_dir"]),
-        processed_dir=Path(data["processed_dir"]),
-        splits_dir=Path(data["splits_dir"]),
-        dry_run=bool(data.get("dry_run", True)),
-    )
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
-def load_experiment_config(path: str | Path) -> ExperimentConfig:
-    data = load_yaml_config(path).get("experiment")
-    if not isinstance(data, dict):
-        raise ConfigError("experiment section is missing or invalid")
-    return ExperimentConfig(
-        model=str(data["model"]),
-        checkpoint=data.get("checkpoint"),
-        image_size=int(data["image_size"]),
-        batch_size=int(data["batch_size"]),
-        epochs=int(data["epochs"]),
-        device=str(data["device"]),
-        train_ratio=float(data["train_ratio"]),
-        val_ratio=float(data["val_ratio"]),
-        test_ratio=float(data["test_ratio"]),
-    )
+def load_config_bundle(
+    experiment_path: str | Path,
+    *,
+    model_path: str | Path | None = None,
+    hardware_path: str | Path | None = None,
+    run_path: str | Path | None = None,
+) -> ExperimentConfig:
+    payload = load_yaml_config(experiment_path)
+    for extra_path in [model_path, hardware_path, run_path]:
+        if extra_path:
+            payload = _deep_merge(payload, load_yaml_config(extra_path))
+    if "experiment" not in payload:
+        raise ConfigError("experiment section is missing")
+    return _coerce_exp(_require_mapping(payload["experiment"], "experiment"))
+
+
+def config_to_dict(cfg: ExperimentConfig) -> dict[str, Any]:
+    data = asdict(cfg)
+    data["dataset_yaml"] = str(cfg.dataset_yaml)
+    data["dataset_split_yaml"] = str(cfg.dataset_split_yaml) if cfg.dataset_split_yaml else None
+    data["resume_checkpoint"] = str(cfg.resume_checkpoint) if cfg.resume_checkpoint else None
+    data["run"]["output_root"] = str(cfg.run.output_root)
+    return data
+
+
+def validate_experiment_config(
+    cfg: ExperimentConfig,
+    *,
+    dry_run: bool = False,
+    gpu_ready: bool = True,
+    allow_cpu_smoke: bool = False,
+) -> list[str]:
+    errors: list[str] = []
+    if not cfg.dataset_yaml.exists():
+        errors.append(f"missing dataset YAML: {cfg.dataset_yaml}")
+    if cfg.dataset_split_yaml is not None and not cfg.dataset_split_yaml.exists():
+        errors.append(f"missing split YAML: {cfg.dataset_split_yaml}")
+    if cfg.model.family not in MODEL_FAMILIES:
+        errors.append(f"unknown model family: {cfg.model.family}")
+    if cfg.image_size <= 0:
+        errors.append("invalid image size")
+    if cfg.epochs <= 0:
+        errors.append("invalid epoch count")
+    if cfg.batch_size <= 0:
+        errors.append("invalid batch size")
+    if cfg.hardware.workers < 0:
+        errors.append("workers must be non-negative")
+    if cfg.hardware.device.startswith("cuda") and not gpu_ready:
+        errors.append("incompatible GPU execution on this machine")
+    if cfg.hardware.device == "cpu" and cfg.hardware.require_gpu:
+        errors.append("incompatible CPU/GPU execution: GPU required")
+    if (
+        cfg.hardware.device == "cpu"
+        and cfg.hardware.allow_cpu_training is False
+        and not allow_cpu_smoke
+    ):
+        errors.append("CPU training is disabled for this run")
+    if cfg.run.validation_split not in SPLITS or cfg.run.test_split not in SPLITS:
+        errors.append("invalid split name")
+    if cfg.run.validation_split == "test":
+        errors.append("test split misuse for validation")
+    if cfg.run.test_split == cfg.run.validation_split:
+        errors.append("validation and test splits must differ")
+    if cfg.run.resume and cfg.resume_checkpoint is None:
+        errors.append("resume requested without checkpoint")
+    if cfg.run.resume and cfg.resume_checkpoint is not None and not cfg.resume_checkpoint.exists():
+        errors.append("resume checkpoint missing")
+    if cfg.model.family not in MODEL_FAMILIES:
+        errors.append("unknown model family")
+    if cfg.run.output_root.exists() and not cfg.run.output_root.is_dir():
+        errors.append("output collision at output_root")
+    if cfg.model.task != "detect":
+        errors.append("unsupported task")
+    if cfg.model.requires_external_repo:
+        errors.append("unknown checkpoint or unsupported external repo model")
+    if dry_run and cfg.run.repeated_runs <= 0:
+        errors.append("repeated_runs must be positive")
+    if not gpu_ready and cfg.hardware.device.startswith("cuda"):
+        errors.append("CUDA device unavailable")
+    return errors

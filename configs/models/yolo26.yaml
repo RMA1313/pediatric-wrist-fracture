@@ -1,5 +1,10 @@
 model:
-  name: yolo26
+  family: yolo26
+  checkpoint: yolo26n.pt
+  scale: n
   task: detect
-  pretrained: true
+  implementation: ultralytics
+  supports_training: true
+  requires_external_repo: false
+  nms_free_default: true
 

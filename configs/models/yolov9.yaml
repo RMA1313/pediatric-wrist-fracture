@@ -1,6 +1,10 @@
 model:
-  name: yolov9
+  family: yolov9
+  checkpoint: yolov9t.pt
+  scale: t
   task: detect
-  pretrained: true
-  implementation_status: unresolved
+  implementation: ultralytics
+  supports_training: true
+  requires_external_repo: false
+  nms_free_default: false
 
