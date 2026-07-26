@@ -162,3 +162,31 @@ YOLOv9t full run:
 ```powershell
 uv run python scripts/train.py --config configs/experiment.yaml --model-config configs/models/yolov9.yaml --hardware-config configs/hardware/rtx4090.yaml --run-config configs/runs/full.yaml --execute
 ```
+
+## 18. Run the Phase 5 full experiment suite
+
+Dry run:
+
+```powershell
+uv run python scripts/run_full_experiment_suite.py --dry-run
+```
+
+Execute:
+
+```powershell
+uv run python scripts/run_full_experiment_suite.py --execute
+```
+
+Resume an existing suite:
+
+```powershell
+uv run python scripts/run_full_experiment_suite.py --suite-id <existing-suite-id> --resume --execute
+```
+
+Reuse completed model runs when compatible:
+
+```powershell
+uv run python scripts/run_full_experiment_suite.py --suite-id <existing-suite-id> --skip-completed --execute
+```
+
+The suite trains YOLOv8n, YOLOv9t, and YOLO26n sequentially on the single RTX 4090, records only training and validation metrics, and never uses the test split during Phase 5.

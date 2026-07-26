@@ -18,6 +18,8 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - Validation metric: `metrics/mAP50-95(B)`
 - Smoke-suite dry-run: `uv run python scripts/run_smoke_suite.py --dry-run`
 - Smoke-suite execute: `uv run python scripts/run_smoke_suite.py --execute`
+- Full-suite dry-run: `uv run python scripts/run_full_experiment_suite.py --dry-run`
+- Full-suite execute: `uv run python scripts/run_full_experiment_suite.py --execute`
 - Validation/benchmark suite dry-run: `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --dry-run`
 - Validation/benchmark suite execute: `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --execute`
 - Smoke metrics are pipeline checks only and are not scientific results.
@@ -30,6 +32,8 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - `make train-dry-run-yolo26n`
 - `make smoke-suite-dry-run`
 - `make smoke-suite`
+- `make full-suite-dry-run`
+- `make full-suite`
 - `make gpu-preflight`
 - `make transfer-manifest`
 - `make transfer-verify`
@@ -54,3 +58,4 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - CPU execution is limited to development smoke paths.
 - Test-set evaluation requires `--allow-test`.
 - Model checkpoints are required explicitly for evaluation and benchmarking.
+- Phase 5 full training requires validated calibration evidence and the frozen `configs/runs/full.yaml` protocol before execution.

@@ -4,6 +4,7 @@ PYTHON ?= python
 	experiment-check experiment-validate \
 	train-dry-run-yolov8n train-dry-run-yolov9t train-dry-run-yolo26n \
 	smoke-suite-dry-run smoke-suite \
+	full-suite-dry-run full-suite \
 	evaluate-dry-run benchmark-dry-run validation-benchmark-dry-run validation-benchmark-suite gpu-preflight transfer-manifest transfer-verify \
 	dataset-info dataset-download dataset-verify dataset-extract \
 	dataset-inspect dataset-convert dataset-split dataset-validate \
@@ -48,6 +49,12 @@ smoke-suite-dry-run:
 
 smoke-suite:
 	uv run python scripts/run_smoke_suite.py --execute
+
+full-suite-dry-run:
+	uv run python scripts/run_full_experiment_suite.py --dry-run $(if $(SUITE_ID),--suite-id $(SUITE_ID),) $(if $(MODELS),--models $(MODELS),) $(if $(RESUME),--resume,) $(if $(SKIP_COMPLETED),--skip-completed,)
+
+full-suite:
+	uv run python scripts/run_full_experiment_suite.py --execute $(if $(SUITE_ID),--suite-id $(SUITE_ID),) $(if $(MODELS),--models $(MODELS),) $(if $(RESUME),--resume,) $(if $(SKIP_COMPLETED),--skip-completed,) $(if $(RECOVER),--recover,) $(if $(CONTINUE_ON_ERROR),--continue-on-error,) $(if $(FORCE),--force,)
 
 evaluate-dry-run:
 	uv run python scripts/evaluate.py --config configs/experiment.yaml --checkpoint data/processed/yolo/dataset.yaml --dry-run

@@ -17,3 +17,4 @@
 - Added run-directory markers for started, interrupted, and completed states.
 - Added transfer-manifest verification so the GPU machine can confirm repository and dataset readiness before running experiments.
 - Added a dedicated validation and benchmark suite that reuses the smoke-suite checkpoints, validates only `val`, and keeps smoke metrics marked as non-scientific pipeline verification outputs.
+- Added a frozen Phase 5 full-training suite that executes YOLOv8n, YOLOv9t, and YOLO26n sequentially on one RTX 4090, requires validated calibration evidence, and refuses to use the test split.
