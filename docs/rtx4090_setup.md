@@ -117,7 +117,23 @@ uv run python scripts/run_smoke_suite.py --execute
 
 The suite writes outputs under `outputs/smoke_suites/<suite_id>/`, reuses the existing training and recovery code, and refuses to run if smoke safety caps are violated.
 
-## 15. Inspect artifacts
+## 15. Run validation and benchmarking on the smoke checkpoints
+
+Dry run:
+
+```powershell
+uv run python scripts/run_validation_benchmark_suite.py --source-suite outputs/smoke_suites/<suite_id> --dry-run
+```
+
+Execute:
+
+```powershell
+uv run python scripts/run_validation_benchmark_suite.py --source-suite outputs/smoke_suites/<suite_id> --execute
+```
+
+This suite evaluates only the `val` split, benchmarks the completed smoke checkpoints sequentially on the RTX 4090, and keeps the resulting metrics explicitly labeled as pipeline-validation outputs rather than final thesis results.
+
+## 16. Inspect artifacts
 
 Check:
 
@@ -127,7 +143,7 @@ Check:
 - `outputs/experiments/<model_family>/<run_id>/metrics/`
 - `outputs/experiments/<model_family>/<run_id>/checkpoints/`
 
-## 16. Run full experiments only after explicit approval
+## 17. Run full experiments only after explicit approval
 
 YOLO26 full run:
 

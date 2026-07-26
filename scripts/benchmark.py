@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from wrist_fracture.config import ConfigError, load_config_bundle, validate_experiment_config
-from wrist_fracture.models.registry import resolve_model_spec
+from wrist_fracture.validation_benchmark_suite import benchmark_checkpoint
 
 
 def main() -> None:
@@ -16,51 +15,64 @@ def main() -> None:
     parser.add_argument("--run-config")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=30)
+    parser.add_argument("--samples", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--benchmark-id")
+    parser.add_argument("--output-dir")
     args = parser.parse_args()
+
+    if not args.execute and not args.dry_run:
+        raise ConfigError("benchmark requires explicit --execute")
     cfg = load_config_bundle(
         args.config,
         model_path=args.model_config,
         hardware_path=args.hardware_config,
         run_path=args.run_config,
     )
-    if not Path(args.checkpoint).exists():
-        raise ConfigError(f"checkpoint not found: {args.checkpoint}")
-    errors = validate_experiment_config(cfg, dry_run=not args.execute, gpu_ready=False)
+    errors = validate_experiment_config(cfg, dry_run=not args.execute)
     if errors:
         raise ConfigError("; ".join(errors))
-    spec = resolve_model_spec(cfg.model)
-    payload = {
-        "config": args.config,
-        "checkpoint": args.checkpoint,
-        "model": {"family": spec.family, "checkpoint": spec.checkpoint, "scale": spec.scale},
-        "dry_run": args.dry_run,
-        "execute": args.execute,
-        "protocol": {
-            "batch_size": 1,
-            "warmup_iterations": args.warmup,
-            "measured_samples": args.samples,
-            "metrics": [
-                "preprocess_latency",
-                "model_latency",
-                "postprocess_latency",
-                "total_latency",
-                "mean",
-                "median",
-                "std",
-                "p95",
-                "throughput",
-                "peak_gpu_memory",
-            ],
-        },
-    }
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    if args.execute and not args.dry_run:
-        raise NotImplementedError("Benchmark execution is intentionally disabled in this phase.")
+    checkpoint = Path(args.checkpoint)
+    if not checkpoint.exists() or not checkpoint.is_file():
+        raise ConfigError(f"checkpoint not found: {checkpoint}")
+    out_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else Path("outputs/benchmarks") / (args.benchmark_id or checkpoint.stem)
+    )
+    print(
+        {
+            "config": args.config,
+            "checkpoint": str(checkpoint),
+            "warmup": args.warmup,
+            "samples": args.samples,
+            "batch_size": args.batch_size,
+            "device": args.device,
+            "output_dir": str(out_dir),
+        }
+    )
+    if args.dry_run or not args.execute:
+        return
+    if out_dir.exists():
+        raise ConfigError(f"output collision: {out_dir}")
+    images = sorted((Path("data/processed/yolo/images/val")).glob("*"))
+    benchmark_checkpoint(
+        checkpoint=checkpoint,
+        images=images,
+        cfg_path=Path(args.config),
+        model_cfg=Path(args.model_config) if args.model_config else None,
+        hardware_cfg=Path(args.hardware_config) if args.hardware_config else None,
+        run_cfg=Path(args.run_config) if args.run_config else None,
+        warmup=args.warmup,
+        samples=args.samples,
+        batch_size=args.batch_size,
+        execute=True,
+        out_dir=out_dir,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

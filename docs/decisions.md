@@ -16,3 +16,4 @@
 - Added separate hardware and run config layers to support CPU development and RTX 4090 execution profiles.
 - Added run-directory markers for started, interrupted, and completed states.
 - Added transfer-manifest verification so the GPU machine can confirm repository and dataset readiness before running experiments.
+- Added a dedicated validation and benchmark suite that reuses the smoke-suite checkpoints, validates only `val`, and keeps smoke metrics marked as non-scientific pipeline verification outputs.

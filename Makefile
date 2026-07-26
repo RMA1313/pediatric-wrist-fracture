@@ -4,7 +4,7 @@ PYTHON ?= python
 	experiment-check experiment-validate \
 	train-dry-run-yolov8n train-dry-run-yolov9t train-dry-run-yolo26n \
 	smoke-suite-dry-run smoke-suite \
-	evaluate-dry-run benchmark-dry-run gpu-preflight transfer-manifest transfer-verify \
+	evaluate-dry-run benchmark-dry-run validation-benchmark-dry-run validation-benchmark-suite gpu-preflight transfer-manifest transfer-verify \
 	dataset-info dataset-download dataset-verify dataset-extract \
 	dataset-inspect dataset-convert dataset-split dataset-validate \
 	dataset-figures dataset-smoke dataset-prepare
@@ -53,6 +53,12 @@ evaluate-dry-run:
 
 benchmark-dry-run:
 	uv run python scripts/benchmark.py --config configs/experiment.yaml --checkpoint data/processed/yolo/dataset.yaml --dry-run
+
+validation-benchmark-dry-run:
+	uv run python scripts/run_validation_benchmark_suite.py --source-suite $(SOURCE_SUITE) --dry-run
+
+validation-benchmark-suite:
+	uv run python scripts/run_validation_benchmark_suite.py --source-suite $(SOURCE_SUITE) --execute
 
 gpu-preflight:
 	uv run python scripts/gpu_preflight.py

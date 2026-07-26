@@ -6,7 +6,7 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 
 - Phase 2 dataset preparation is complete.
 - Phase 3 infrastructure is being finalized.
-- No training, inference, or benchmark run is executed in this repository phase.
+- Real validation and benchmark execution are supported for the completed smoke checkpoints, but the repository still treats those results as pipeline verification rather than final science.
 
 ## Core controls
 
@@ -18,6 +18,8 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - Validation metric: `metrics/mAP50-95(B)`
 - Smoke-suite dry-run: `uv run python scripts/run_smoke_suite.py --dry-run`
 - Smoke-suite execute: `uv run python scripts/run_smoke_suite.py --execute`
+- Validation/benchmark suite dry-run: `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --dry-run`
+- Validation/benchmark suite execute: `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --execute`
 - Smoke metrics are pipeline checks only and are not scientific results.
 
 ## Safe commands
@@ -33,6 +35,8 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - `make transfer-verify`
 - `make evaluate-dry-run`
 - `make benchmark-dry-run`
+- `make validation-benchmark-dry-run SOURCE_SUITE=<path>`
+- `make validation-benchmark-suite SOURCE_SUITE=<path>`
 - `make test`
 - `make lint`
 - `make format`

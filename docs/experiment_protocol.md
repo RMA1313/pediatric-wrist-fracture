@@ -18,6 +18,7 @@ Compare YOLOv8n, YOLOv9t, and YOLO26n on the same immutable pediatric wrist frac
 - Test isolation: test split is held out from model selection
 - Model-selection metric: `metrics/mAP50-95(B)`
 - Latency benchmark protocol: fixed batch size 1, bounded warmup, bounded measured samples, recorded environment and checkpoint metadata
+- Validation policy: val split only for this phase; test split is held out until explicitly approved later
 
 ## Primary models
 
@@ -62,6 +63,8 @@ Compare YOLOv8n, YOLOv9t, and YOLO26n on the same immutable pediatric wrist frac
 - CPU full training is rejected.
 - Test-set evaluation requires `--allow-test`.
 - Evaluation and benchmarking require an explicit checkpoint path.
+- Validation and benchmark runs reuse the completed smoke checkpoints and do not alter dataset manifests or splits.
+- The unified suite command is `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --execute`.
 - The Phase 3 smoke suite is run through `uv run python scripts/run_smoke_suite.py --dry-run` or `uv run python scripts/run_smoke_suite.py --execute`.
 - Smoke-suite outputs are stored under `outputs/smoke_suites/<suite_id>/`.
 - Smoke metrics are for pipeline verification only and are not scientific results.
