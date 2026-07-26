@@ -3,6 +3,7 @@ PYTHON ?= python
 .PHONY: setup audit test lint format \
 	experiment-check experiment-validate \
 	train-dry-run-yolov8n train-dry-run-yolov9t train-dry-run-yolo26n \
+	smoke-suite-dry-run smoke-suite \
 	evaluate-dry-run benchmark-dry-run gpu-preflight transfer-manifest transfer-verify \
 	dataset-info dataset-download dataset-verify dataset-extract \
 	dataset-inspect dataset-convert dataset-split dataset-validate \
@@ -40,6 +41,12 @@ train-dry-run-yolo26n:
 
 train-dry-run:
 	uv run python scripts/train.py --config configs/experiment.yaml --dry-run
+
+smoke-suite-dry-run:
+	uv run python scripts/run_smoke_suite.py --dry-run
+
+smoke-suite:
+	uv run python scripts/run_smoke_suite.py --execute
 
 evaluate-dry-run:
 	uv run python scripts/evaluate.py --config configs/experiment.yaml --checkpoint data/processed/yolo/dataset.yaml --dry-run

@@ -62,6 +62,9 @@ Compare YOLOv8n, YOLOv9t, and YOLO26n on the same immutable pediatric wrist frac
 - CPU full training is rejected.
 - Test-set evaluation requires `--allow-test`.
 - Evaluation and benchmarking require an explicit checkpoint path.
+- The Phase 3 smoke suite is run through `uv run python scripts/run_smoke_suite.py --dry-run` or `uv run python scripts/run_smoke_suite.py --execute`.
+- Smoke-suite outputs are stored under `outputs/smoke_suites/<suite_id>/`.
+- Smoke metrics are for pipeline verification only and are not scientific results.
 
 ## Outputs
 

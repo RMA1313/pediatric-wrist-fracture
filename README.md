@@ -16,6 +16,9 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - Default image size: 640
 - Seed: 42
 - Validation metric: `metrics/mAP50-95(B)`
+- Smoke-suite dry-run: `uv run python scripts/run_smoke_suite.py --dry-run`
+- Smoke-suite execute: `uv run python scripts/run_smoke_suite.py --execute`
+- Smoke metrics are pipeline checks only and are not scientific results.
 
 ## Safe commands
 
@@ -23,6 +26,8 @@ This repository contains the research infrastructure for a bachelor’s thesis o
 - `make train-dry-run-yolov8n`
 - `make train-dry-run-yolov9t`
 - `make train-dry-run-yolo26n`
+- `make smoke-suite-dry-run`
+- `make smoke-suite`
 - `make gpu-preflight`
 - `make transfer-manifest`
 - `make transfer-verify`

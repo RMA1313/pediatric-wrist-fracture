@@ -101,7 +101,23 @@ uv run python scripts/train.py --config configs/experiment.yaml --model-config c
 
 This repository phase still keeps the actual training path guarded, so the smoke command is documented for the GPU machine workflow after Phase 3 approval.
 
-## 14. Inspect artifacts
+## 14. Run the complete smoke suite
+
+Dry run:
+
+```powershell
+uv run python scripts/run_smoke_suite.py --dry-run
+```
+
+Execute:
+
+```powershell
+uv run python scripts/run_smoke_suite.py --execute
+```
+
+The suite writes outputs under `outputs/smoke_suites/<suite_id>/`, reuses the existing training and recovery code, and refuses to run if smoke safety caps are violated.
+
+## 15. Inspect artifacts
 
 Check:
 
@@ -111,7 +127,7 @@ Check:
 - `outputs/experiments/<model_family>/<run_id>/metrics/`
 - `outputs/experiments/<model_family>/<run_id>/checkpoints/`
 
-## 15. Run full experiments only after explicit approval
+## 16. Run full experiments only after explicit approval
 
 YOLO26 full run:
 
