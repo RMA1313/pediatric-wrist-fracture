@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any
 
 from wrist_fracture.config import (
@@ -171,6 +173,124 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _is_nan_or_inf(value: Any) -> bool:
+    try:
+        import math
+
+        if isinstance(value, float):
+            return math.isnan(value) or math.isinf(value)
+    except Exception:
+        pass
+    return False
+
+
+def _json_safe_number(value: Any) -> float | int | None:
+    parsed = _to_float(value)
+    if parsed is None or _is_nan_or_inf(parsed):
+        return None
+    if float(parsed).is_integer():
+        return int(parsed)
+    return parsed
+
+
+def _validate_results_csv_columns(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        raise ConfigError("results.csv is empty")
+    expected = {
+        "epoch",
+        "metrics/precision(B)",
+        "metrics/recall(B)",
+        "metrics/mAP50(B)",
+        "metrics/mAP50-95(B)",
+    }
+    missing = sorted(expected.difference(rows[0].keys()))
+    if missing:
+        raise ConfigError(f"results.csv missing expected columns: {', '.join(missing)}")
+
+
+def _serialize_public_metric(value: Any) -> dict[str, Any] | None:
+    public: dict[str, Any] = {}
+    for attr in ("mp", "mr", "map50", "map", "fitness"):
+        if hasattr(value, attr):
+            public[attr] = _json_safe_number(getattr(value, attr))
+    for attr in ("p", "r", "f1", "maps", "ap", "ap50", "ap75", "nc", "nt_per_class"):
+        if hasattr(value, attr):
+            public[attr] = _normalize_json_value(getattr(value, attr))
+    if hasattr(value, "speed"):
+        public["speed"] = _normalize_json_value(value.speed)
+    if hasattr(value, "results_dict"):
+        public["results_dict"] = _normalize_json_value(value.results_dict)
+    if hasattr(value, "summary"):
+        summary = value.summary
+        if callable(summary):
+            try:
+                public["summary"] = _normalize_json_value(summary())
+            except TypeError:
+                pass
+    if public:
+        public["type"] = type(value).__name__
+        return public
+    return None
+
+
+def _normalize_json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return None if _is_nan_or_inf(value) else value
+    if isinstance(value, Path):
+        return str(value)
+    metric_payload = _serialize_public_metric(value)
+    if metric_payload is not None:
+        return metric_payload
+    if dataclasses.is_dataclass(value):
+        normalized = _normalize_json_value(dataclasses.asdict(value))
+        if isinstance(normalized, dict):
+            normalized["type"] = type(value).__name__
+        return normalized
+    try:
+        import numpy as np
+
+        if isinstance(value, np.generic):
+            return _normalize_json_value(value.item())
+        if isinstance(value, np.ndarray):
+            return [_normalize_json_value(item) for item in value.tolist()]
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return _normalize_json_value(value.item())
+            return [_normalize_json_value(item) for item in value.detach().cpu().tolist()]
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_json_value(item)
+            for key, item in value.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_normalize_json_value(item) for item in value]
+    if hasattr(value, "__dict__"):
+        public = {
+            key: _normalize_json_value(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+        if public:
+            public["type"] = type(value).__name__
+            return public
+    try:
+        return json.loads(json.dumps(value))
+    except Exception:
+        return str(value)
+
+
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     import csv
 
@@ -213,6 +333,41 @@ def _normalize_history(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _schema_versioned_validation_payload(
+    *,
+    metrics: dict[str, Any],
+    save_dir: Path,
+    raw_results: Any,
+) -> dict[str, Any]:
+    precision = _json_safe_number(metrics.get("final_precision"))
+    recall = _json_safe_number(metrics.get("final_recall"))
+    map50 = _json_safe_number(metrics.get("final_map50"))
+    map50_95 = _json_safe_number(metrics.get("final_map50_95"))
+    f1 = None
+    if precision is not None and recall is not None and (precision + recall) != 0:
+        f1 = 2 * precision * recall / (precision + recall)
+    payload = {
+        "schema_version": 1,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "map50": map50,
+        "map50_95": map50_95,
+        "fitness": _json_safe_number(getattr(raw_results, "fitness", None))
+        if raw_results is not None
+        else None,
+        "per_class_ap": _normalize_json_value(getattr(raw_results, "maps", None))
+        if raw_results is not None
+        else None,
+        "speed": _normalize_json_value(getattr(raw_results, "speed", None))
+        if raw_results is not None
+        else None,
+        "raw_results": _normalize_json_value(raw_results),
+        "ultralytics_save_dir": str(save_dir),
+    }
+    return payload
+
+
 def _metrics_from_history(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {}
@@ -231,10 +386,61 @@ def _metrics_from_history(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _recover_training_artifacts(root: Path) -> None:
+    raw_candidates = sorted((root / "raw").glob("**/results.csv"))
+    if not raw_candidates:
+        raise ConfigError("no raw Ultralytics results.csv found for recovery")
+    history_src = raw_candidates[0]
+    save_dir = history_src.parent
+    rows = _read_csv_rows(history_src)
+    _validate_results_csv_columns(rows)
+    history_rows = _normalize_history(rows)
+    _write_csv_rows(root / "metrics" / "history.csv", history_rows)
+    metrics = _metrics_from_history(history_rows)
+    checkpoints = _collect_checkpoint_paths(save_dir)
+    best_src = checkpoints["best"]
+    last_src = checkpoints["last"]
+    if best_src is None or last_src is None:
+        raise ConfigError("missing expected Ultralytics checkpoints")
+    actual_best = _maybe_copy_or_link(best_src, root / "checkpoints" / "best.pt")
+    actual_last = _maybe_copy_or_link(last_src, root / "checkpoints" / "last.pt")
+    validation_payload = _schema_versioned_validation_payload(
+        metrics=metrics,
+        save_dir=save_dir,
+        raw_results=SimpleNamespace(
+            fitness=metrics.get("best_map50_95"),
+            maps=metrics.get("best_map50_95"),
+            speed=None,
+        ),
+    )
+    _write_validation_json(root, validation_payload)
+    summary_payload = {
+        "run_status": "completed",
+        "started_at": None,
+        "ended_at": _now(),
+        "duration_seconds": None,
+        "gpu_peak_memory_bytes": None,
+        "checkpoint_paths": {"best": str(actual_best), "last": str(actual_last)},
+        "ultralytics_save_dir": str(save_dir),
+        "config": None,
+        "execute": True,
+        "smoke": True,
+        **metrics,
+    }
+    write_atomic(
+        root / "metrics" / "run_summary.json",
+        json.dumps(_normalize_json_value(summary_payload), indent=2, sort_keys=True),
+    )
+    interrupted = root / "interrupted.marker"
+    if interrupted.exists():
+        interrupted.unlink()
+    (root / "completed.marker").write_text(_now(), encoding="utf-8")
+
+
 def _write_validation_json(root: Path, payload: dict[str, Any]) -> None:
     write_atomic(
         root / "metrics" / "validation.json",
-        json.dumps(payload, indent=2, sort_keys=True),
+        json.dumps(_normalize_json_value(payload), indent=2, sort_keys=True),
     )
 
 
@@ -270,8 +476,12 @@ def _write_run_summary(
     }
     write_atomic(
         root / "metrics" / "run_summary.json",
-        json.dumps(payload, indent=2, sort_keys=True),
+        json.dumps(_normalize_json_value(payload), indent=2, sort_keys=True),
     )
+
+
+def _recover_from_run_root(root: Path) -> None:
+    _recover_training_artifacts(root)
 
 
 def _execute_training(cfg: ExperimentConfig, root: Path) -> None:
@@ -337,9 +547,9 @@ def _execute_training_with_args(
         trainer = getattr(model, "trainer", None)
         save_dir = Path(getattr(trainer, "save_dir", root / "raw" / "train"))
         history_src = save_dir / "results.csv"
-        history_rows = (
-            _normalize_history(_read_csv_rows(history_src)) if history_src.exists() else []
-        )
+        history_rows_raw = _read_csv_rows(history_src) if history_src.exists() else []
+        _validate_results_csv_columns(history_rows_raw)
+        history_rows = _normalize_history(history_rows_raw)
         _write_csv_rows(root / "metrics" / "history.csv", history_rows)
         metrics = _metrics_from_history(history_rows)
         checkpoints = _collect_checkpoint_paths(save_dir)
@@ -360,14 +570,24 @@ def _execute_training_with_args(
         except Exception:
             gpu_peak_memory_bytes = None
         validation_payload = {
+            "schema_version": 1,
             "precision": metrics.get("final_precision"),
             "recall": metrics.get("final_recall"),
+            "f1": None,
             "map50": metrics.get("final_map50"),
             "map50_95": metrics.get("final_map50_95"),
             "best_epoch": metrics.get("best_epoch"),
             "best_map50_95": metrics.get("best_map50_95"),
-            "raw_results": to_jsonable(getattr(results, "__dict__", {})),
+            "fitness": _json_safe_number(getattr(results, "fitness", None)),
+            "per_class_ap": _normalize_json_value(getattr(results, "maps", None)),
+            "speed": _normalize_json_value(getattr(results, "speed", None)),
+            "raw_results": _normalize_json_value(results),
         }
+        if validation_payload["precision"] is not None and validation_payload["recall"] is not None:
+            p = validation_payload["precision"]
+            r = validation_payload["recall"]
+            if p + r != 0:
+                validation_payload["f1"] = 2 * p * r / (p + r)
         _write_validation_json(root, validation_payload)
         ended_at = _now()
         duration_seconds = perf_counter() - start_perf
@@ -424,9 +644,17 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--recover-postprocessing", action="store_true")
+    parser.add_argument("--run-root")
     parser.add_argument("--allow-cpu-smoke", action="store_true")
     parser.add_argument("--print-resolved-config", action="store_true")
     args = parser.parse_args()
+
+    if getattr(args, "recover_postprocessing", False):
+        if not args.run_root:
+            raise ConfigError("--run-root is required with --recover-postprocessing")
+        _recover_from_run_root(Path(args.run_root))
+        return
 
     cfg = resolve_config(args)
     if args.smoke:

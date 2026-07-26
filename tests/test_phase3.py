@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -458,7 +460,19 @@ def test_ultralytics_argument_mapping_preserves_smoke_values(monkeypatch: pytest
     fake_ultralytics = ModuleType("ultralytics")
     fake_ultralytics.YOLO = FakeYOLO
     monkeypatch.setitem(train.sys.modules, "ultralytics", fake_ultralytics)
-    monkeypatch.setattr(train, "_read_csv_rows", lambda path: [])
+    monkeypatch.setattr(
+        train,
+        "_read_csv_rows",
+        lambda path: [
+            {
+                "epoch": "0",
+                "metrics/precision(B)": "0.1",
+                "metrics/recall(B)": "0.2",
+                "metrics/mAP50(B)": "0.3",
+                "metrics/mAP50-95(B)": "0.4",
+            }
+        ],
+    )
     monkeypatch.setattr(
         train, "_collect_checkpoint_paths", lambda save_dir: {"best": None, "last": None}
     )
@@ -469,6 +483,12 @@ def test_ultralytics_argument_mapping_preserves_smoke_values(monkeypatch: pytest
     monkeypatch.setattr(train, "write_atomic", lambda *a, **k: None)
     monkeypatch.setattr(
         train, "resolve_model_spec", lambda model: SimpleNamespace(checkpoint="yolov8n.pt")
+    )
+    (root / "raw" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "raw" / "train" / "results.csv").write_text(
+        "epoch,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "0,0.1,0.2,0.3,0.4\n",
+        encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="missing expected Ultralytics checkpoints"):
         train._execute_training_with_args(cfg, root, SimpleNamespace(execute=True, smoke=True))
@@ -514,6 +534,138 @@ def test_checkpoint_collection_and_metric_normalization(tmp_path: Path):
     assert metrics["final_recall"] == 0.6
     assert metrics["final_map50"] == 0.7
     assert metrics["final_map50_95"] == 0.8
+
+
+@dataclass
+class _MockMetric:
+    p: object
+    r: object
+    f1: object
+    maps: object
+    fitness: object
+    speed: object
+    ap_class_index: object
+
+    @property
+    def mp(self):
+        return self.p[0]
+
+    @property
+    def mr(self):
+        return self.r[0]
+
+    @property
+    def map50(self):
+        return self.maps[0]
+
+    @property
+    def map(self):
+        return self.maps
+
+
+@dataclass
+class _MockDetMetrics:
+    box: object
+    speed: object
+
+    @property
+    def results_dict(self):
+        return {
+            "precision": self.box.mp,
+            "recall": self.box.mr,
+            "f1": self.box.f1,
+            "per_class_ap": self.box.maps,
+            "speed": self.speed,
+        }
+
+
+def test_recursive_json_normalizer_handles_ultralytics_like_objects(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    np = pytest.importorskip("numpy")
+    metric = _MockMetric(
+        p=np.array([0.5, 0.25]),
+        r=np.array([0.4, 0.2]),
+        f1=np.array([0.44444444, 0.22222222]),
+        maps=np.array([0.6, 0.1]),
+        fitness=np.float32(0.33),
+        speed={"preprocess": np.float64(1.2), "inference": torch.tensor(2.3)},
+        ap_class_index=np.array([0, 1]),
+    )
+    det = _MockDetMetrics(
+        box=metric,
+        speed={"preprocess": np.nan, "inference": np.inf, "postprocess": -np.inf},
+    )
+    payload = {
+        "path": tmp_path / "x",
+        "metric": metric,
+        "det": det,
+        "tensor": torch.tensor([1.0, 2.0]),
+        "array": np.array([[1, 2], [3, 4]], dtype=np.int64),
+        "scalar": np.float64(7.0),
+        "nested": [{"value": np.nan}, SimpleNamespace(path=tmp_path / "y")],
+    }
+    normalized = train._normalize_json_value(payload)
+    assert normalized["path"] == str(tmp_path / "x")
+    assert normalized["metric"]["type"] == "_MockMetric"
+    assert normalized["metric"]["mp"] == 0.5
+    assert normalized["metric"]["fitness"] == pytest.approx(0.33, rel=1e-6)
+    assert normalized["metric"]["speed"]["preprocess"] == 1.2
+    assert normalized["det"]["results_dict"]["speed"]["inference"] is None
+    assert normalized["tensor"] == [1.0, 2.0]
+    assert normalized["array"] == [[1, 2], [3, 4]]
+    assert normalized["scalar"] == 7
+    assert normalized["nested"][0]["value"] is None
+
+
+def test_validation_payload_is_versioned_and_schema_stable():
+    payload = train._schema_versioned_validation_payload(
+        metrics={
+            "final_precision": 0.5,
+            "final_recall": 0.25,
+            "final_map50": 0.75,
+            "final_map50_95": 0.6,
+            "best_map50_95": 0.6,
+        },
+        save_dir=Path("raw/train"),
+        raw_results=SimpleNamespace(
+            fitness=0.6,
+            maps=[0.9, 0.8],
+            speed={"preprocess": 1.0},
+        ),
+    )
+    assert payload["schema_version"] == 1
+    assert payload["precision"] == 0.5
+    assert payload["recall"] == 0.25
+    assert payload["f1"] == pytest.approx(0.3333333333)
+    assert payload["map50"] == 0.75
+    assert payload["map50_95"] == 0.6
+    assert payload["fitness"] == 0.6
+    assert payload["per_class_ap"] == [0.9, 0.8]
+    assert payload["speed"] == {"preprocess": 1.0}
+
+
+def test_recovery_normalizes_existing_raw_artifacts(tmp_path: Path):
+    root = tmp_path / "outputs" / "yolov8" / "smoke-run"
+    weights = root / "raw" / "train" / "weights"
+    weights.mkdir(parents=True)
+    (weights / "best.pt").write_text("best", encoding="utf-8")
+    (weights / "last.pt").write_text("last", encoding="utf-8")
+    (root / "raw" / "train" / "results.csv").write_text(
+        "epoch,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "0,0.1,0.2,0.3,0.4\n"
+        "1,0.5,0.6,0.7,0.8\n",
+        encoding="utf-8",
+    )
+    (root / "interrupted.marker").write_text("failed", encoding="utf-8")
+    train._recover_from_run_root(root)
+    assert (root / "completed.marker").exists()
+    assert not (root / "interrupted.marker").exists()
+    validation = json.loads((root / "metrics" / "validation.json").read_text(encoding="utf-8"))
+    summary = json.loads((root / "metrics" / "run_summary.json").read_text(encoding="utf-8"))
+    assert validation["schema_version"] == 1
+    assert validation["map50_95"] == 0.8
+    assert summary["run_status"] == "completed"
+    assert summary["checkpoint_paths"]["best"].endswith("best.pt")
 
 
 def test_interrupt_and_completion_markers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
