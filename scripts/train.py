@@ -143,6 +143,30 @@ def _execute_training(cfg: ExperimentConfig, root: Path) -> None:
     )
 
 
+SMOKE_SAFETY_CAPS = {
+    "image_size": 320,
+    "epochs": 1,
+    "batch_size": 4,
+    "patience": 1,
+    "run.repeated_runs": 1,
+}
+
+
+def _validate_smoke_caps(cfg: ExperimentConfig) -> list[str]:
+    errors: list[str] = []
+    if cfg.image_size > SMOKE_SAFETY_CAPS["image_size"]:
+        errors.append("smoke image_size exceeds safety cap")
+    if cfg.epochs > SMOKE_SAFETY_CAPS["epochs"]:
+        errors.append("smoke epochs exceeds safety cap")
+    if cfg.batch_size > SMOKE_SAFETY_CAPS["batch_size"]:
+        errors.append("smoke batch_size exceeds safety cap")
+    if cfg.patience > SMOKE_SAFETY_CAPS["patience"]:
+        errors.append("smoke patience exceeds safety cap")
+    if cfg.run.repeated_runs > SMOKE_SAFETY_CAPS["run.repeated_runs"]:
+        errors.append("smoke repeated_runs exceeds safety cap")
+    return errors
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/experiment.yaml")
@@ -166,8 +190,8 @@ def main() -> None:
             model=cfg.model,
             hardware=cfg.hardware,
             run=cfg.run,
-            image_size=min(cfg.image_size, 320),
-            epochs=min(cfg.epochs, 1),
+            image_size=cfg.image_size,
+            epochs=cfg.epochs,
             patience=cfg.patience,
             seed=cfg.seed,
             pretrained=cfg.pretrained,
@@ -191,6 +215,8 @@ def main() -> None:
         dry_run=not args.execute,
         allow_cpu_smoke=args.allow_cpu_smoke and args.smoke,
     )
+    if args.smoke:
+        errors.extend(_validate_smoke_caps(cfg))
     if errors:
         raise ConfigError("; ".join(errors))
     run_id = build_run_id(cfg)

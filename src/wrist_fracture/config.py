@@ -96,6 +96,27 @@ class ExperimentConfig:
         return 0.15
 
 
+RUN_OVERLAY_KEYS = {
+    "image_size",
+    "epochs",
+    "patience",
+    "seed",
+    "pretrained",
+    "optimizer",
+    "lr0",
+    "lrf",
+    "weight_decay",
+    "augmentation",
+    "resume_checkpoint",
+    "save_json",
+    "batch_size",
+    "dataset",
+    "model",
+    "hardware",
+    "run",
+}
+
+
 @dataclass(frozen=True)
 class ProjectConfig:
     name: str
@@ -253,6 +274,15 @@ def load_config_bundle(
                             _require_mapping(experiment.get(section), f"experiment.{section}"),
                             _require_mapping(extra[section], f"{extra_path}.{section}"),
                         )
+                for key, value in extra.items():
+                    if key in RUN_OVERLAY_KEYS:
+                        if isinstance(value, dict) and isinstance(experiment.get(key), dict):
+                            experiment[key] = _deep_merge(
+                                _require_mapping(experiment.get(key), f"experiment.{key}"),
+                                _require_mapping(value, f"{extra_path}.{key}"),
+                            )
+                        else:
+                            experiment[key] = value
     if "experiment" not in payload:
         raise ConfigError("experiment section is missing")
     payload["experiment"] = experiment

@@ -1,3 +1,7 @@
+image_size: 320
+epochs: 1
+patience: 1
+batch_size: 4
 run:
   name: smoke
   output_root: outputs/experiments

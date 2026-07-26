@@ -152,6 +152,40 @@ run:
     return experiment, model, hardware, run
 
 
+def _write_smoke_overlay_bundle(
+    tmp_path: Path,
+    *,
+    image_size: int = 320,
+    epochs: int = 1,
+    patience: int = 1,
+    batch_size: int = 4,
+    repeated_runs: int = 1,
+) -> tuple[Path, Path]:
+    experiment = _write_bundle(tmp_path)
+    smoke = tmp_path / "smoke.yaml"
+    smoke.write_text(
+        f"""
+image_size: {image_size}
+epochs: {epochs}
+patience: {patience}
+batch_size: {batch_size}
+run:
+  repeated_runs: {repeated_runs}
+  name: smoke
+  output_root: {tmp_path.as_posix()}/outputs
+  resume: false
+  save_period: 1
+  validation_split: val
+  test_split: test
+  allow_test_evaluation: false
+  selection_metric: metrics/mAP50-95(B)
+  batch_size_policy: fixed
+""",
+        encoding="utf-8",
+    )
+    return experiment, smoke
+
+
 def test_config_composition(tmp_path: Path):
     exp = _write_bundle(tmp_path)
     cfg = load_config_bundle(exp)
@@ -184,6 +218,59 @@ def test_rtx4090_overlay_resolves_gpu_device(tmp_path: Path):
     )
     assert cfg.hardware.device == "cuda:0"
     assert cfg.hardware.require_gpu is True
+
+
+def test_smoke_overlay_resolves_bounded_values(tmp_path: Path):
+    experiment, smoke = _write_smoke_overlay_bundle(tmp_path)
+    cfg = load_config_bundle(experiment, run_path=smoke)
+    assert cfg.image_size == 320
+    assert cfg.epochs == 1
+    assert cfg.patience == 1
+    assert cfg.batch_size == 4
+    assert cfg.run.repeated_runs == 1
+
+
+def test_full_overlay_still_resolves_full_protocol(tmp_path: Path):
+    cfg = load_config_bundle(
+        Path("configs/experiment.yaml"),
+        model_path=Path("configs/models/yolov8.yaml"),
+        hardware_path=Path("configs/hardware/cpu-dev.yaml"),
+        run_path=Path("configs/runs/full.yaml"),
+    )
+    assert cfg.image_size == 640
+    assert cfg.epochs == 100
+    assert cfg.patience == 20
+    assert cfg.batch_size == 1
+    assert cfg.run.repeated_runs == 1
+
+
+def test_smoke_execute_refuses_configs_above_caps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    experiment, smoke = _write_smoke_overlay_bundle(
+        tmp_path, image_size=640, epochs=100, patience=20, batch_size=8, repeated_runs=3
+    )
+    monkeypatch.setattr(
+        train.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: type(
+            "Args",
+            (object,),
+            {
+                "config": str(experiment),
+                "model_config": None,
+                "hardware_config": None,
+                "run_config": str(smoke),
+                "dry_run": False,
+                "preflight": False,
+                "smoke": True,
+                "execute": True,
+                "resume": False,
+                "allow_cpu_smoke": True,
+                "print_resolved_config": False,
+            },
+        )(),
+    )
+    with pytest.raises(ConfigError, match="smoke .* exceeds safety cap"):
+        train.main()
 
 
 def test_validate_invalid_values(tmp_path: Path):
@@ -474,6 +561,22 @@ def test_resume_conflict_rejected(tmp_path: Path):
     cfg.dataset_yaml.write_text("x: y\n", encoding="utf-8")
     errors = validate_experiment_config(cfg, dry_run=True)
     assert any("resume checkpoint missing" in e for e in errors)
+
+
+def test_merge_precedence_is_deterministic(tmp_path: Path):
+    experiment, model, hardware, run = _write_composed_bundle(
+        tmp_path, hardware_device="cuda:0", model_family="yolov9", run_name="overlay"
+    )
+    cfg = load_config_bundle(
+        experiment,
+        model_path=model,
+        hardware_path=hardware,
+        run_path=run,
+    )
+    assert cfg.model.family == "yolov9"
+    assert cfg.hardware.device == "cuda:0"
+    assert cfg.run.name == "overlay"
+    assert cfg.run.output_root == tmp_path / "outputs"
 
 
 def test_model_registry_resolution_without_downloads():
