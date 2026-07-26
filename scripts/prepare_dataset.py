@@ -31,7 +31,6 @@ from wrist_fracture.data.preparation import (
     build_patient_split,
     classify_label,
     dedupe_boxes,
-    ensure_idempotent_remove,
     parse_dataset_csv,
     parse_pascalvoc,
     parse_supervisely,
@@ -41,6 +40,8 @@ from wrist_fracture.data.preparation import (
     write_csv,
 )
 from wrist_fracture.paths import get_paths
+
+PIPELINE_CACHE_SCHEMA = 2
 
 
 def _now() -> float:
@@ -183,14 +184,36 @@ def _compare_annotation_worker(item: tuple[str, str]) -> dict[str, Any]:
 def _load_stage_cache(cache_path: Path) -> dict[str, Any]:
     data = _load_json_file(cache_path)
     if not data or not isinstance(data, dict):
-        return {"entries": {}}
+        return {"schema_version": PIPELINE_CACHE_SCHEMA, "entries": {}}
+    if data.get("schema_version") != PIPELINE_CACHE_SCHEMA:
+        return {"schema_version": PIPELINE_CACHE_SCHEMA, "entries": {}}
     if "entries" not in data or not isinstance(data["entries"], dict):
-        return {"entries": {}}
+        return {"schema_version": PIPELINE_CACHE_SCHEMA, "entries": {}}
     return data
 
 
 def _save_stage_cache(cache_path: Path, payload: dict[str, Any]) -> None:
+    payload = {"schema_version": PIPELINE_CACHE_SCHEMA, **payload}
     _atomic_write_text(cache_path, json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _format_rate(done: int, elapsed: float) -> str:
+    if elapsed <= 0:
+        return "0.0"
+    return f"{done / elapsed:.2f}"
+
+
+def _stage_status(
+    stage: str, done: int, total: int, started: float, workers: int, strategy: str = ""
+) -> str:
+    elapsed = _now() - started
+    eta = ((total - done) / (done / elapsed)) if done and elapsed > 0 else 0.0
+    suffix = f" strategy={strategy}" if strategy else ""
+    return (
+        f"{stage}: {done}/{total} "
+        f"rate={_format_rate(done, elapsed)} it/s "
+        f"elapsed={elapsed:.1f}s eta={eta:.1f}s workers={workers}{suffix}"
+    )
 
 
 def _run_bounded(
@@ -245,6 +268,58 @@ def _run_bounded(
         if bar:
             bar.close()
     return results
+
+
+def _run_bounded_in_order(
+    *,
+    items: list[Any],
+    worker,
+    workers: int,
+    batch_size: int,
+    stage: str,
+    progress: bool,
+    use_processes: bool,
+) -> list[Any]:
+    results = _run_bounded(
+        items=items,
+        worker=worker,
+        workers=workers,
+        batch_size=batch_size,
+        stage=stage,
+        progress=progress,
+        use_processes=use_processes,
+    )
+    return sorted(results, key=lambda item: item.get("order", 0))
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        try:
+            if (
+                dst.stat().st_size == src.stat().st_size
+                and dst.stat().st_mtime_ns >= src.stat().st_mtime_ns
+            ):
+                return "existing"
+        except FileNotFoundError:
+            pass
+        dst.unlink()
+    try:
+        os.link(src, dst)
+        return "hardlink"
+    except OSError:
+        shutil.copy2(src, dst)
+        return "copy"
+
+
+def _write_text_atomic_if_changed(path: Path, text: str) -> bool:
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    return True
 
 
 def load_dataset_assets(raw_dir: Path) -> dict[str, Path]:
@@ -414,9 +489,11 @@ def build_records(
     for xml_path, json_path, _stem in comparable_pairs:
         key = f"{xml_path}|{json_path}"
         cached = comparison_cache.get(key)
-        if cached and cached.get("xml_key") == _file_cache_key(Path(xml_path)) and cached.get(
-            "json_key"
-        ) == _file_cache_key(Path(json_path)):
+        if (
+            cached
+            and cached.get("xml_key") == _file_cache_key(Path(xml_path))
+            and cached.get("json_key") == _file_cache_key(Path(json_path))
+        ):
             comparison_results.append(cached["result"])
         else:
             compare_items.append((xml_path, json_path))
@@ -476,10 +553,7 @@ def build_records(
         ann_path = row["xml_path"] or row["json_path"]
         if ann_result:
             fmt = ann_result["kind"]
-            boxes = [
-                AnnotationBox(**box)
-                for box in ann_result.get("raw_boxes", [])
-            ]
+            boxes = [AnnotationBox(**box) for box in ann_result.get("raw_boxes", [])]
         if not boxes:
             summary["missing_annotations"] += 1
         boxes = dedupe_boxes(boxes)
@@ -517,9 +591,7 @@ def build_records(
         if row["stem"] in image_results
     }
     annotation_cache_entries = {
-        (
-            row["xml_path"].as_posix() if row["xml_path"] else row["json_path"].as_posix()
-        ): {
+        (row["xml_path"].as_posix() if row["xml_path"] else row["json_path"].as_posix()): {
             "key": _file_cache_key(row["xml_path"] or row["json_path"]),
             "result": annotation_results[row["stem"]],
         }
@@ -573,8 +645,7 @@ def compare_annotation_formats(raw_dir: Path) -> dict[str, Any]:
         _, _, _, x = parse_pascalvoc(xmls[stem])
         _, _, j = parse_supervisely(jsons[stem])
         if len(x) == len(j) and all(
-            a.key() == b.key()
-            for a, b in zip(dedupe_boxes(x), dedupe_boxes(j), strict=False)
+            a.key() == b.key() for a, b in zip(dedupe_boxes(x), dedupe_boxes(j), strict=False)
         ):
             match += 1
         else:
@@ -589,54 +660,152 @@ def compare_annotation_formats(raw_dir: Path) -> dict[str, Any]:
     }
 
 
-def convert_to_yolo(
-    records: list[ImageRecord], processed_dir: Path, negative_empty: bool = True
+def _convert_record_worker(item: tuple[int, ImageRecord, bool]) -> dict[str, Any]:
+    order, rec, negative_empty = item
+    lines: list[str] = []
+    invalid = 0
+    for box in rec.fracture_boxes:
+        try:
+            cls, cx, cy, bw, bh = box.to_yolo(rec.width, rec.height)
+            lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        except ValueError:
+            invalid += 1
+    return {
+        "order": order,
+        "stem": rec.stem,
+        "label_text": "\n".join(lines) + ("\n" if lines else ""),
+        "has_label": bool(lines),
+        "invalid_boxes": invalid,
+        "patient_id": rec.patient_id,
+        "study_id": rec.study_id,
+        "source_annotation": str(rec.annotation_path) if rec.annotation_path else None,
+        "source_format": rec.annotation_format,
+        "image_path": rec.image_path.as_posix(),
+        "fracture_boxes": len(lines),
+        "negative_empty": negative_empty,
+    }
+
+
+def _materialize_task_worker(
+    item: tuple[str, str, str, str, str, list[str], bool],
 ) -> dict[str, Any]:
+    split, src_path, dst_img, dst_lbl, stem, lines, negative_empty = item
+    method = _link_or_copy(Path(src_path), Path(dst_img))
+    label_text = "\n".join(lines) + ("\n" if lines else "")
+    if lines or negative_empty:
+        _write_text_atomic_if_changed(Path(dst_lbl), label_text)
+    return {"split": split, "stem": stem, "copy_method": method, "lines": len(lines)}
+
+
+def convert_to_yolo(
+    records: list[ImageRecord],
+    processed_dir: Path,
+    *,
+    workers: int = 1,
+    batch_size: int = 16,
+    progress: bool = False,
+    force: bool = False,
+    negative_empty: bool = True,
+) -> dict[str, Any]:
+    cache_dir = processed_dir.parent / "interim" / "conversion"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_cache = cache_dir / "conversion_manifest.json"
     images_root = processed_dir / "images"
     labels_root = processed_dir / "labels"
-    ensure_idempotent_remove(images_root)
-    ensure_idempotent_remove(labels_root)
     images_root.mkdir(parents=True, exist_ok=True)
     labels_root.mkdir(parents=True, exist_ok=True)
-    manifest: list[dict[str, Any]] = []
-    counts = Counter()
-    for rec in records:
-        img_dst = images_root / f"{rec.stem}.png"
-        if not img_dst.exists():
-            shutil.copy2(rec.image_path, img_dst)
+
+    cached_manifest = {} if force else _load_stage_cache(manifest_cache).get("entries", {})
+    tasks: list[tuple[int, ImageRecord, bool]] = []
+    for order, rec in enumerate(records):
         label_path = labels_root / f"{rec.stem}.txt"
-        lines = []
-        invalid = 0
-        for box in rec.fracture_boxes:
-            try:
-                cls, cx, cy, bw, bh = box.to_yolo(rec.width, rec.height)
-                lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-                counts["fracture_boxes"] += 1
-            except ValueError:
-                invalid += 1
-        if lines or negative_empty:
-            label_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        img_dst = images_root / f"{rec.stem}.png"
+        cache_key = {
+            "image": _file_cache_key(rec.image_path),
+            "label_count": len(rec.fracture_boxes),
+            "width": rec.width,
+            "height": rec.height,
+            "negative_empty": negative_empty,
+        }
+        cached = cached_manifest.get(rec.stem)
+        if (
+            not force
+            and cached
+            and cached.get("key") == cache_key
+            and img_dst.exists()
+            and label_path.exists()
+        ):
+            continue
+        tasks.append((order, rec, negative_empty))
+
+    started = _now()
+    strategy = "hardlink->copy"
+    rows = _run_bounded_in_order(
+        items=tasks,
+        worker=_convert_record_worker,
+        workers=workers,
+        batch_size=batch_size,
+        stage="convert",
+        progress=progress,
+        use_processes=False,
+    )
+    counts = Counter()
+    manifest: list[dict[str, Any]] = []
+    manifest_entries: dict[str, Any] = {}
+    record_by_stem = {rec.stem: rec for rec in records}
+    for item in rows:
+        rec = record_by_stem[item["stem"]]
+        img_dst = images_root / f"{rec.stem}.png"
+        lbl_dst = labels_root / f"{rec.stem}.txt"
+        method = _link_or_copy(rec.image_path, img_dst)
+        strategy = method if strategy == "hardlink->copy" else strategy
+        if item["has_label"] or negative_empty:
+            _write_text_atomic_if_changed(lbl_dst, item["label_text"])
         counts["images"] += 1
-        counts["positive_images" if lines else "negative_images"] += 1
-        manifest.append(
-            {
-                "stem": rec.stem,
-                "image_path": str(img_dst),
-                "label_path": str(label_path),
-                "patient_id": rec.patient_id,
-                "study_id": rec.study_id,
-                "fracture_boxes": len(lines),
-                "invalid_boxes": invalid,
-                "source_annotation": str(rec.annotation_path) if rec.annotation_path else None,
-                "source_format": rec.annotation_format,
-            }
-        )
-    write_csv(processed_dir / "manifests" / "conversion_manifest.csv", manifest)
+        counts["positive_images" if item["has_label"] else "negative_images"] += 1
+        counts["fracture_boxes"] += item["fracture_boxes"]
+        manifest_row = {
+            "stem": rec.stem,
+            "image_path": str(img_dst),
+            "label_path": str(lbl_dst),
+            "patient_id": rec.patient_id,
+            "study_id": rec.study_id,
+            "fracture_boxes": item["fracture_boxes"],
+            "invalid_boxes": item["invalid_boxes"],
+            "source_annotation": item["source_annotation"],
+            "source_format": item["source_format"],
+            "copy_method": method,
+        }
+        manifest.append(manifest_row)
+        cache_key = {
+            "image": _file_cache_key(rec.image_path),
+            "label_count": len(rec.fracture_boxes),
+            "width": rec.width,
+            "height": rec.height,
+            "negative_empty": negative_empty,
+        }
+        manifest_entries[rec.stem] = {
+            "key": cache_key,
+            "result": manifest_row,
+        }
+
+    if not manifest and not force:
+        existing = _load_stage_cache(manifest_cache).get("entries", {})
+        manifest = [item["result"] for item in existing.values()]
+        manifest.sort(key=lambda row: row["stem"])
+    else:
+        _save_stage_cache(manifest_cache, {"entries": manifest_entries})
+        manifest.sort(key=lambda row: row["stem"])
+        write_csv(processed_dir / "manifests" / "conversion_manifest.csv", manifest)
     return {
         "counts": dict(counts),
         "manifest_rows": len(manifest),
         "images_dir": str(images_root),
         "labels_dir": str(labels_root),
+        "copy_strategy": strategy,
+        "elapsed_s": _now() - started,
+        "workers": workers,
+        "batch_size": batch_size,
     }
 
 
@@ -698,53 +867,102 @@ def validate_records(
     return {"errors": errors, "invalid_boxes": box_errors, "image_count": len(records)}
 
 
+def validate_processed_dataset(
+    processed_dir: Path,
+    workers: int = 1,
+    batch_size: int = 64,
+    progress: bool = False,
+) -> dict[str, Any]:
+    yolo_dir = processed_dir / "yolo"
+    manifest = processed_dir / "manifests" / "conversion_manifest.csv"
+    issues: list[str] = []
+    if not yolo_dir.exists():
+        return {"errors": ["processed dataset missing"], "valid": False}
+    manifest_rows = []
+    if manifest.exists():
+        import csv
+
+        with manifest.open("r", encoding="utf-8", newline="") as fh:
+            manifest_rows = list(csv.DictReader(fh))
+    splits = {}
+    for split in ("train", "val", "test"):
+        img_dir = yolo_dir / "images" / split
+        lbl_dir = yolo_dir / "labels" / split
+        splits[split] = {
+            "images": len(list(img_dir.glob("*.png"))),
+            "labels": len(list(lbl_dir.glob("*.txt"))),
+        }
+        if splits[split]["images"] != splits[split]["labels"]:
+            issues.append(f"{split} image/label count mismatch")
+    if not (yolo_dir / "dataset.yaml").exists():
+        issues.append("dataset.yaml missing")
+    return {
+        "errors": issues,
+        "valid": not issues,
+        "manifest_rows": len(manifest_rows),
+        "splits": splits,
+        "workers": workers,
+        "batch_size": batch_size,
+        "progress": progress,
+    }
+
+
 def generate_dataset_figures(
-    records: list[ImageRecord], figure_dir: Path, seed: int = 42
+    records: list[ImageRecord],
+    figure_dir: Path,
+    seed: int = 42,
+    *,
+    force: bool = False,
 ) -> list[str]:
     figure_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = figure_dir / "figure_manifest.json"
+    existing = {} if force else _load_stage_cache(cache_path).get("entries", {})
     source_labels = Counter(b.label for rec in records for b in rec.all_boxes)
     pos = [1 if rec.fracture_boxes else 0 for rec in records]
-    render_histogram(
-        list(source_labels.values()),
-        figure_dir / "source_label_distribution.png",
-        "Source Label Distribution",
-        "Count per label",
-    )
-    render_histogram(
-        [rec.width for rec in records],
-        figure_dir / "image_width_distribution.png",
-        "Image Width Distribution",
-        "Width (px)",
-    )
-    render_histogram(
-        [rec.height for rec in records],
-        figure_dir / "image_height_distribution.png",
-        "Image Height Distribution",
-        "Height (px)",
-    )
-    render_histogram(
-        [rec.width / rec.height for rec in records if rec.height],
-        figure_dir / "aspect_ratio_distribution.png",
-        "Aspect Ratio Distribution",
-        "Width / Height",
-    )
-    render_histogram(
-        [len(rec.fracture_boxes) for rec in records],
-        figure_dir / "fracture_boxes_per_image.png",
-        "Fracture Boxes per Image",
-        "Boxes",
-    )
-    render_histogram(
-        [sum((b.xmax - b.xmin) * (b.ymax - b.ymin) for b in rec.fracture_boxes) for rec in records],
-        figure_dir / "fracture_bbox_area_distribution.png",
-        "Fracture Bounding Box Area Distribution",
-        "Pixel area",
-    )
-    render_histogram(
-        pos,
-        figure_dir / "positive_negative_distribution.png",
-        "Positive vs Negative Images",
-        "Binary label",
+    figures = {
+        "source_label_distribution.png": (
+            list(source_labels.values()),
+            "Source Label Distribution",
+            "Count per label",
+        ),
+        "image_width_distribution.png": (
+            [rec.width for rec in records],
+            "Image Width Distribution",
+            "Width (px)",
+        ),
+        "image_height_distribution.png": (
+            [rec.height for rec in records],
+            "Image Height Distribution",
+            "Height (px)",
+        ),
+        "aspect_ratio_distribution.png": (
+            [rec.width / rec.height for rec in records if rec.height],
+            "Aspect Ratio Distribution",
+            "Width / Height",
+        ),
+        "fracture_boxes_per_image.png": (
+            [len(rec.fracture_boxes) for rec in records],
+            "Fracture Boxes per Image",
+            "Boxes",
+        ),
+        "fracture_bbox_area_distribution.png": (
+            [
+                sum((b.xmax - b.xmin) * (b.ymax - b.ymin) for b in rec.fracture_boxes)
+                for rec in records
+            ],
+            "Fracture Bounding Box Area Distribution",
+            "Pixel area",
+        ),
+        "positive_negative_distribution.png": (pos, "Positive vs Negative Images", "Binary label"),
+    }
+    for name, (values, title, xlabel) in figures.items():
+        out = figure_dir / name
+        if not force and out.exists() and existing.get(name):
+            continue
+        render_histogram(values, out, title, xlabel)
+    _save_stage_cache(
+        cache_path,
+        {"entries": {name: {"count": len(values)} for name, (values, _, _) in figures.items()}},
     )
     return [str(p) for p in sorted(figure_dir.glob("*.png"))]
 
@@ -767,6 +985,9 @@ def build_final_dataset(
     processed_dir: Path,
     splits: dict[str, list[ImageRecord]],
     force: bool = False,
+    workers: int = 1,
+    batch_size: int = 16,
+    progress: bool = False,
 ) -> Path:
     yolo_dir = processed_dir / "yolo"
     if force and yolo_dir.exists():
@@ -774,25 +995,41 @@ def build_final_dataset(
     for split in ("train", "val", "test"):
         (yolo_dir / "images" / split).mkdir(parents=True, exist_ok=True)
         (yolo_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+    tasks = []
     for split, rows in splits.items():
         for rec in rows:
-            img_dst = yolo_dir / "images" / split / rec.image_path.name
-            lbl_dst = yolo_dir / "labels" / split / f"{rec.stem}.txt"
-            if not img_dst.exists():
-                shutil.copy2(rec.image_path, img_dst)
-            lines = []
+            lines: list[str] = []
             for box in rec.fracture_boxes:
                 try:
                     cls, cx, cy, bw, bh = box.to_yolo(rec.width, rec.height)
                     lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
                 except ValueError:
                     pass
-            lbl_dst.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            tasks.append(
+                (
+                    split,
+                    rec.image_path.as_posix(),
+                    (yolo_dir / "images" / split / rec.image_path.name).as_posix(),
+                    (yolo_dir / "labels" / split / f"{rec.stem}.txt").as_posix(),
+                    rec.stem,
+                    lines,
+                    True,
+                )
+            )
+    _run_bounded(
+        items=tasks,
+        worker=_materialize_task_worker,
+        workers=workers,
+        batch_size=batch_size,
+        stage="materialize",
+        progress=progress,
+        use_processes=False,
+    )
     write_dataset_yaml(yolo_dir)
     return yolo_dir
 
 
-def smoke_load_dataset(yolo_dir: Path) -> dict[str, Any]:
+def smoke_load_dataset(yolo_dir: Path, max_batches: int = 2) -> dict[str, Any]:
     from ultralytics import YOLO
 
     model = YOLO("yolov8n.pt")
@@ -801,6 +1038,7 @@ def smoke_load_dataset(yolo_dir: Path) -> dict[str, Any]:
         "dataset_yaml": str(yolo_dir / "dataset.yaml"),
         "model_loaded": bool(model),
         "data_keys": sorted(list(data.keys())) if isinstance(data, dict) else [],
+        "max_batches": max_batches,
     }
 
 
@@ -907,16 +1145,63 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
-    records, _ = build_records(args.raw_dir)
-    comparison = compare_annotation_formats(args.raw_dir)
+    started = _now()
+    _safe_print(
+        "convert: "
+        f"workers={args.workers} "
+        f"io_workers={args.io_workers} "
+        f"batch_size={args.batch_size} "
+        f"progress={args.progress}"
+    )
+    records, summary = build_records(
+        args.raw_dir,
+        workers=args.io_workers,
+        hash_workers=args.hash_workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+        force=args.force,
+    )
+    comparison = summary.get("comparison", compare_annotation_formats(args.raw_dir))
     split_records = make_splits(records, seed=args.seed)
-    conversion = convert_to_yolo(records, args.processed_dir)
+    conversion = convert_to_yolo(
+        records,
+        args.processed_dir,
+        workers=args.workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+        force=args.force,
+    )
     split_stats = save_split_files(split_records, args.splits_dir)
-    save_json(args.conversion_report, {"conversion": conversion, "comparison": comparison})
+    save_json(
+        args.conversion_report,
+        {
+            "conversion": conversion,
+            "comparison": comparison,
+            "profiling": summary.get("stage_times", {}),
+        },
+    )
     save_json(args.split_report, split_stats)
     save_json(args.dataset_report, summarize(records, comparison))
-    generate_dataset_figures(records, args.figures_dir)
-    write_dataset_yaml(args.processed_dir / "yolo")
+    generate_dataset_figures(records, args.figures_dir, force=args.force)
+    build_final_dataset(
+        records,
+        args.processed_dir,
+        split_records,
+        force=args.force,
+        workers=args.io_workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+    )
+    _safe_print(
+        _stage_status(
+            "convert",
+            len(records),
+            len(records),
+            started,
+            args.workers,
+            conversion.get("copy_strategy", ""),
+        )
+    )
     return 0
 
 
@@ -925,14 +1210,60 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    records, _ = build_records(args.raw_dir)
+    records, summary = build_records(
+        args.raw_dir,
+        workers=args.io_workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+        force=args.force,
+    )
     split_records = make_splits(records, seed=args.seed)
-    save_json(args.validation_report, validate_records(records, split_records))
+    save_json(
+        args.validation_report,
+        {
+            "raw": validate_records(records, split_records),
+            "processed": validate_processed_dataset(
+                args.processed_dir,
+                workers=args.io_workers,
+                batch_size=args.batch_size,
+                progress=args.progress,
+            ),
+            "inspection": summary.get("stage_times", {}),
+        },
+    )
     return 0
 
 
 def cmd_smoke(args: argparse.Namespace) -> int:
-    save_json(args.smoke_report, smoke_load_dataset(args.processed_dir / "yolo"))
+    save_json(
+        args.smoke_report,
+        smoke_load_dataset(args.processed_dir / "yolo", max_batches=args.max_batches),
+    )
+    return 0
+
+
+def cmd_split(args: argparse.Namespace) -> int:
+    records, _ = build_records(
+        args.raw_dir,
+        workers=args.io_workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+        force=args.force,
+    )
+    split_records = make_splits(records, seed=args.seed)
+    save_json(args.split_report, save_split_files(split_records, args.splits_dir))
+    return 0
+
+
+def cmd_figures(args: argparse.Namespace) -> int:
+    records, _ = build_records(
+        args.raw_dir,
+        workers=args.io_workers,
+        batch_size=args.batch_size,
+        progress=args.progress,
+        force=args.force,
+    )
+    generate_dataset_figures(records, args.figures_dir, force=args.force)
     return 0
 
 
@@ -988,7 +1319,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     c.add_argument("--figures-dir", type=Path, default=get_paths().figures / "dataset_statistics")
     c.add_argument("--seed", type=int, default=42)
+    c.add_argument("--workers", type=int, default=_default_workers())
+    c.add_argument("--io-workers", type=int, default=max(8, _default_workers() * 2))
+    c.add_argument("--hash-workers", type=int, default=None)
+    c.add_argument("--batch-size", type=int, default=32)
+    c.add_argument("--force", action="store_true")
+    c.add_argument("--progress", action="store_true")
     c.set_defaults(func=cmd_convert)
+
+    sp = sub.add_parser("split")
+    sp.add_argument("--raw-dir", type=Path, default=get_paths().raw)
+    sp.add_argument("--splits-dir", type=Path, default=get_paths().splits)
+    sp.add_argument(
+        "--split-report", type=Path, default=get_paths().dataset_reports / "split_report.json"
+    )
+    sp.add_argument("--seed", type=int, default=42)
+    sp.add_argument("--io-workers", type=int, default=max(8, _default_workers() * 2))
+    sp.add_argument("--batch-size", type=int, default=32)
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--progress", action="store_true")
+    sp.set_defaults(func=cmd_split)
+
+    f = sub.add_parser("figures")
+    f.add_argument("--raw-dir", type=Path, default=get_paths().raw)
+    f.add_argument("--figures-dir", type=Path, default=get_paths().figures / "dataset_statistics")
+    f.add_argument("--io-workers", type=int, default=max(8, _default_workers() * 2))
+    f.add_argument("--batch-size", type=int, default=32)
+    f.add_argument("--force", action="store_true")
+    f.add_argument("--progress", action="store_true")
+    f.set_defaults(func=cmd_figures)
 
     v = sub.add_parser("validate")
     v.add_argument("--raw-dir", type=Path, default=get_paths().raw)
@@ -997,7 +1356,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=get_paths().dataset_reports / "validation_report.json",
     )
+    v.add_argument("--processed-dir", type=Path, default=get_paths().processed)
     v.add_argument("--seed", type=int, default=42)
+    v.add_argument("--io-workers", type=int, default=max(8, _default_workers() * 2))
+    v.add_argument("--batch-size", type=int, default=64)
+    v.add_argument("--force", action="store_true")
+    v.add_argument("--progress", action="store_true")
     v.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("smoke")
@@ -1005,6 +1369,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--smoke-report", type=Path, default=get_paths().dataset_reports / "smoke_report.json"
     )
+    s.add_argument("--max-batches", type=int, default=2)
     s.set_defaults(func=cmd_smoke)
 
     p2 = sub.add_parser("prepare")
@@ -1024,6 +1389,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p2.add_argument("--figures-dir", type=Path, default=get_paths().figures / "dataset_statistics")
     p2.add_argument("--seed", type=int, default=42)
+    p2.add_argument("--workers", type=int, default=_default_workers())
+    p2.add_argument("--io-workers", type=int, default=max(8, _default_workers() * 2))
+    p2.add_argument("--hash-workers", type=int, default=None)
+    p2.add_argument("--batch-size", type=int, default=32)
+    p2.add_argument("--force", action="store_true")
+    p2.add_argument("--progress", action="store_true")
     p2.set_defaults(func=cmd_prepare)
     return p
 
