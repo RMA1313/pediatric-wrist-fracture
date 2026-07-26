@@ -17,6 +17,7 @@ from wrist_fracture.validation_benchmark_suite import (
     deterministic_sample_manifest,
     discover_source_runs,
     evaluate_checkpoint,
+    resolve_checkpoint_path,
     select_runs,
     validate_required_numeric_fields,
 )
@@ -55,6 +56,8 @@ def _summary_value(value: Any) -> Any:
 class ModelResult:
     model_family: str
     source_smoke_run: str
+    source_checkpoint: str
+    source_checkpoint_sha256: str | None
     checkpoint: str
     checkpoint_sha256: str | None
     status: str
@@ -208,16 +211,26 @@ def main() -> int:
     }
 
     commands: list[str] = []
+    diagnostics: list[str] = []
     sample_manifest: list[dict[str, Any]] = []
     rows: list[ModelResult] = []
     benchmark_sample_paths: list[Path] | None = None
 
     try:
         for run in source_runs:
-            checkpoint = Path(run["checkpoint"]) / "weights" / "best.pt"
-            if not checkpoint.exists():
-                raise ConfigError(f"checkpoint missing: {checkpoint}")
             model_family = run["model_family"]
+            resolution = resolve_checkpoint_path(
+                run["checkpoint"], sha256=run.get("checkpoint_sha256")
+            )
+            checkpoint = Path(resolution.selected)
+            diagnostics.extend(
+                [
+                    f"model: {model_family}",
+                    f"  source: {resolution.source}",
+                    f"  attempted: {list(resolution.candidates)}",
+                    f"  selected: {resolution.selected}",
+                ]
+            )
             eval_dir = suite_dir / model_family / "evaluation"
             bench_dir = suite_dir / model_family / "benchmark"
             if args.print_commands:
@@ -259,8 +272,10 @@ def main() -> int:
             result = ModelResult(
                 model_family=model_family,
                 source_smoke_run=str(run["run_path"]),
+                source_checkpoint=resolution.source,
+                source_checkpoint_sha256=resolution.sha256,
                 checkpoint=str(checkpoint),
-                checkpoint_sha256=metrics.get("checkpoint_sha256"),
+                checkpoint_sha256=resolution.sha256 or metrics.get("checkpoint_sha256"),
                 status="completed",
                 evaluation_path=str(eval_dir),
                 benchmark_path=str(bench_dir),
@@ -321,6 +336,8 @@ def main() -> int:
             ModelResult(
                 model_family="unknown",
                 source_smoke_run=str(source_suite),
+                source_checkpoint="",
+                source_checkpoint_sha256=None,
                 checkpoint="",
                 checkpoint_sha256=None,
                 status="failed",
@@ -332,6 +349,10 @@ def main() -> int:
     finally:
         if args.print_commands:
             (suite_dir / "commands.txt").write_text("\n".join(commands) + "\n", encoding="utf-8")
+        if diagnostics:
+            (suite_dir / "checkpoint_resolution.txt").write_text(
+                "\n".join(diagnostics) + "\n", encoding="utf-8"
+            )
 
     summary_rows = [asdict(row) for row in rows if row.model_family != "unknown"]
     suite_summary = {
@@ -391,6 +412,10 @@ def main() -> int:
         },
     )
     (suite_dir / "commands.txt").write_text("\n".join(commands) + "\n", encoding="utf-8")
+    if diagnostics:
+        (suite_dir / "checkpoint_resolution.txt").write_text(
+            "\n".join(diagnostics) + "\n", encoding="utf-8"
+        )
     with (suite_dir / "benchmark_sample_manifest.csv").open(
         "w", newline="", encoding="utf-8"
     ) as fh:

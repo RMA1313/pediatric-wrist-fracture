@@ -25,6 +25,63 @@ SCHEMA_VERSION = 1
 MODEL_ORDER = ("yolov8", "yolov9", "yolo26")
 
 
+@dataclass(frozen=True)
+class CheckpointResolution:
+    source: str
+    candidates: tuple[str, ...]
+    selected: str
+    sha256: str | None = None
+
+
+def _checkpoint_candidate_paths(source: Path) -> list[Path]:
+    candidates = [source]
+    if source.suffix == ".pt":
+        return candidates
+    candidates.extend(
+        [
+            source / "checkpoints" / "best.pt",
+            source / "raw" / "train" / "weights" / "best.pt",
+            source / "weights" / "best.pt",
+        ]
+    )
+    return candidates
+
+
+def resolve_checkpoint_path(
+    source: str | Path, *, sha256: str | None = None
+) -> CheckpointResolution:
+    raw_source = str(source)
+    source_path = Path(source)
+    attempted: list[str] = []
+    selected: Path | None = None
+
+    for candidate in _checkpoint_candidate_paths(source_path):
+        candidate_str = str(candidate)
+        attempted.append(candidate_str)
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_file():
+            continue
+        if resolved.suffix != ".pt":
+            continue
+        if resolved.stat().st_size <= 0:
+            continue
+        selected = resolved
+        break
+
+    if selected is None:
+        raise ConfigError(
+            f"checkpoint missing or invalid: source={raw_source}; attempted={attempted}"
+        )
+    return CheckpointResolution(
+        source=raw_source,
+        candidates=tuple(attempted),
+        selected=str(selected),
+        sha256=sha256,
+    )
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
