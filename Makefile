@@ -7,7 +7,8 @@ PYTHON ?= python
 	evaluate-dry-run benchmark-dry-run validation-benchmark-dry-run validation-benchmark-suite gpu-preflight transfer-manifest transfer-verify \
 	dataset-info dataset-download dataset-verify dataset-extract \
 	dataset-inspect dataset-convert dataset-split dataset-validate \
-	dataset-figures dataset-smoke dataset-prepare
+	dataset-figures dataset-smoke dataset-prepare \
+	calibrate calibrate-dry-run
 
 setup:
 	uv sync
@@ -101,3 +102,9 @@ dataset-smoke:
 
 dataset-prepare:
 	uv run python scripts/prepare_dataset.py prepare
+
+calibrate:
+	uv run python scripts/calibrate_rtx4090.py --execute
+
+calibrate-dry-run:
+	uv run python scripts/calibrate_rtx4090.py --dry-run
