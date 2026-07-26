@@ -329,16 +329,74 @@ def collect_optional_artifacts(root: Path, names: Iterable[str]) -> dict[str, st
     return collected
 
 
-def _copy_tree(src: Path, dst: Path) -> None:
+def _canonical_path(path: Path) -> Path:
+    return path.resolve(strict=False)
+
+
+def _path_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left = _canonical_path(left)
+    right = _canonical_path(right)
+    return left == right or _path_within(left, right) or _path_within(right, left)
+
+
+def _safe_copy_tree(src: Path, dst: Path) -> None:
     if not src.exists():
         return
+    src = _canonical_path(src)
+    dst = _canonical_path(dst)
+    if src == dst:
+        return
+    if _paths_overlap(src, dst):
+        raise ConfigError(f"unsafe copy-tree overlap: {src} -> {dst}")
     if src.is_dir():
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in src.iterdir():
+            _safe_copy_tree(child, dst / child.name)
     else:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+
+def _evaluation_paths(out_dir: Path) -> dict[str, Path]:
+    evaluation_root = out_dir.resolve()
+    return {
+        "evaluation_root": evaluation_root,
+        "framework_root": evaluation_root / "framework",
+        "framework_run_dir": evaluation_root / "framework" / "val",
+        "raw_dir": evaluation_root / "raw",
+        "curves_dir": evaluation_root / "curves",
+        "plots_dir": evaluation_root / "plots",
+        "metrics_path": evaluation_root / "metrics.json",
+        "completed_marker": evaluation_root / "completed.marker",
+    }
+
+
+def _recover_evaluation_artifacts(paths: dict[str, Path]) -> dict[str, Any] | None:
+    metrics_path = paths["metrics_path"]
+    if not metrics_path.exists():
+        return None
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8-sig"))
+    if not metrics:
+        return None
+    if not paths["raw_dir"].exists() and paths["framework_run_dir"].exists():
+        _safe_copy_tree(paths["framework_run_dir"], paths["raw_dir"])
+    if not paths["completed_marker"].exists():
+        paths["completed_marker"].write_text(_now(), encoding="utf-8")
+    return {"metrics": metrics, "raw_dir": str(paths["raw_dir"])}
+
+
+def _copy_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    _safe_copy_tree(src, dst)
 
 
 def _complexity_from_model(model: Any, checkpoint: Path, imgsz: int) -> dict[str, Any]:
@@ -434,8 +492,13 @@ def evaluate_checkpoint(
         raise ConfigError(f"unsupported split: {split}")
     if cfg.model.family not in checkpoint.as_posix():
         raise ConfigError("checkpoint/config model-family mismatch")
-    out_dir = out_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=False)
+    paths = _evaluation_paths(out_dir)
+    paths["evaluation_root"].mkdir(parents=True, exist_ok=True)
+    paths["framework_root"].mkdir(parents=True, exist_ok=True)
+    if paths["metrics_path"].exists():
+        recovered = _recover_evaluation_artifacts(paths)
+        if recovered is not None:
+            return recovered
     resolved = {
         "dataset_yaml": str(cfg.dataset_yaml),
         "dataset_yaml_sha256": _sha256_if_exists(cfg.dataset_yaml),
@@ -452,13 +515,13 @@ def evaluate_checkpoint(
         "save_json": True,
         "seed": cfg.seed,
     }
-    _safe_json_write(out_dir / "resolved_config.yaml", resolved)
+    _safe_json_write(paths["evaluation_root"] / "resolved_config.yaml", resolved)
     _safe_json_write(
-        out_dir / "environment.json",
+        paths["evaluation_root"] / "environment.json",
         to_jsonable(collect_environment_report(Path.cwd())),
     )
     _safe_json_write(
-        out_dir / "provenance.json",
+        paths["evaluation_root"] / "provenance.json",
         {
             "git_commit": git_commit(Path.cwd()),
             "git_dirty": git_dirty(Path.cwd()),
@@ -467,10 +530,8 @@ def evaluate_checkpoint(
             "command": " ".join(os.sys.argv),
         },
     )
-    (out_dir / "predictions").mkdir(exist_ok=True)
-    (out_dir / "curves").mkdir(exist_ok=True)
-    (out_dir / "plots").mkdir(exist_ok=True)
-    (out_dir / "raw").mkdir(exist_ok=True)
+    paths["curves_dir"].mkdir(exist_ok=True)
+    paths["plots_dir"].mkdir(exist_ok=True)
     model = YOLO(str(checkpoint))
     eval_start = time.perf_counter()
     results = model.val(
@@ -486,14 +547,14 @@ def evaluate_checkpoint(
         max_det=resolved["max_det"],
         plots=True,
         save_json=True,
-        project=str((out_dir / "raw").resolve()),
+        project=str(paths["framework_root"].resolve()),
         name="val",
         exist_ok=True,
         verbose=False,
         seed=cfg.seed,
     )
     eval_duration = perf_counter() - eval_start
-    raw_dir = out_dir / "raw" / "val"
+    raw_dir = paths["framework_run_dir"]
     artifacts = collect_optional_artifacts(
         raw_dir,
         [
@@ -571,9 +632,9 @@ def evaluate_checkpoint(
             "validation_duration_seconds",
         ],
     )
-    _safe_json_write(out_dir / "metrics.json", metrics)
-    _copy_tree(raw_dir, out_dir / "raw")
-    (out_dir / "completed.marker").write_text(_now(), encoding="utf-8")
+    _safe_json_write(paths["metrics_path"], metrics)
+    _safe_copy_tree(raw_dir, paths["raw_dir"])
+    (paths["completed_marker"]).write_text(_now(), encoding="utf-8")
     return {"metrics": metrics, "raw_dir": str(raw_dir), "duration_seconds": eval_duration}
 
 

@@ -53,8 +53,6 @@ def main() -> None:
     print(plan)
     if args.dry_run or args.preflight or not args.execute:
         return
-    if out_dir.exists():
-        raise ConfigError(f"output collision: {out_dir}")
     evaluate_checkpoint(
         checkpoint=checkpoint,
         cfg_path=Path(args.config),

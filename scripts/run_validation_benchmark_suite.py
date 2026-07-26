@@ -286,11 +286,7 @@ def main() -> int:
                 commands.append(
                     f"uv run python scripts/benchmark.py --execute --checkpoint {checkpoint}"
                 )
-            eval_result = (
-                _load_eval_metrics(eval_dir)
-                if args.resume and _can_resume(eval_dir, "completed.marker")
-                else None
-            )
+            eval_result = _load_eval_metrics(eval_dir) if args.resume else None
             if eval_result is None:
                 eval_result = evaluate_checkpoint(
                     checkpoint=checkpoint,
@@ -302,11 +298,7 @@ def main() -> int:
                     execute=True,
                     out_dir=eval_dir,
                 )
-            bench_result = (
-                _load_benchmark_result(bench_dir)
-                if args.resume and _can_resume(bench_dir, "completed.marker")
-                else None
-            )
+            bench_result = _load_benchmark_result(bench_dir) if args.resume else None
             if bench_result is None:
                 bench_result = benchmark_checkpoint(
                     checkpoint=checkpoint,

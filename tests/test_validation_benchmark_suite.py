@@ -12,7 +12,9 @@ from scripts import run_validation_benchmark_suite as suite
 from wrist_fracture import runtime
 from wrist_fracture.config import ConfigError
 from wrist_fracture.validation_benchmark_suite import (
+    _evaluation_paths,
     _percentile,
+    _safe_copy_tree,
     _summary_stats,
     build_benchmark_image_manifest,
     resolve_checkpoint_path,
@@ -444,3 +446,90 @@ def test_suite_regenerates_stale_manifest_and_resolves_output_paths(tmp_path: Pa
     )
     assert regenerated["selected_sample_count"] == 1
     assert (tmp_path / "outputs/validation_benchmark_suites/suite/suite_summary.json").exists()
+
+
+def test_safe_copy_tree_handles_overlap_and_merge(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    (src / "a").mkdir(parents=True)
+    (src / "a" / "file.txt").write_text("one", encoding="utf-8")
+    _safe_copy_tree(src, dst)
+    assert (dst / "a" / "file.txt").read_text(encoding="utf-8") == "one"
+    _safe_copy_tree(src, src)
+    with pytest.raises(ConfigError):
+        _safe_copy_tree(src, src / "child")
+    with pytest.raises(ConfigError):
+        _safe_copy_tree(src / "a", src)
+    other = tmp_path / "other"
+    (other / "b").mkdir(parents=True)
+    (other / "b" / "file.txt").write_text("two", encoding="utf-8")
+    _safe_copy_tree(other, dst)
+    assert (dst / "b" / "file.txt").read_text(encoding="utf-8") == "two"
+
+
+def test_evaluate_checkpoint_recovers_existing_framework_output(tmp_path: Path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import wrist_fracture.validation_benchmark_suite as vbs
+
+    class FakeYOLO:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def val(self, **kwargs):
+            return SimpleNamespace(
+                results_dict={
+                    "metrics/precision(B)": 1,
+                    "metrics/recall(B)": 1,
+                    "metrics/mAP50(B)": 1,
+                    "metrics/mAP50-95(B)": 1,
+                    "nt_per_class": [1],
+                },
+                speed={"preprocess": 1, "inference": 1, "loss": 1, "postprocess": 1},
+                maps=[1],
+                fitness=1,
+                files=[],
+            )
+
+    out_dir = tmp_path / "evaluation"
+    paths = _evaluation_paths(out_dir)
+    (paths["framework_run_dir"]).mkdir(parents=True, exist_ok=True)
+    (paths["framework_run_dir"] / "predictions.json").write_text("{}", encoding="utf-8")
+    (paths["framework_run_dir"] / "val_batch0_pred.jpg").write_bytes(b"img")
+    metrics_payload = {"precision": 1, "recall": 1, "validation_duration_seconds": 1}
+    (paths["metrics_path"]).write_text(json.dumps(metrics_payload), encoding="utf-8")
+    monkeypatch.setattr(
+        vbs,
+        "load_config_bundle",
+        lambda *args, **kwargs: SimpleNamespace(
+            dataset_yaml=tmp_path / "dataset.yaml",
+            image_size=320,
+            batch_size=1,
+            seed=42,
+            model=SimpleNamespace(family="yolov9"),
+            hardware=SimpleNamespace(workers=0, device="cpu", amp=False),
+        ),
+    )
+    monkeypatch.setattr(vbs, "validate_experiment_config", lambda cfg, dry_run=False: [])
+    monkeypatch.setattr(vbs, "collect_environment_report", lambda _: {})
+    monkeypatch.setattr(vbs, "git_commit", lambda _: None)
+    monkeypatch.setattr(vbs, "git_dirty", lambda _: False)
+    monkeypatch.setattr(vbs, "sha256_file", lambda path: "sha")
+    monkeypatch.setattr(vbs, "to_jsonable", lambda value: value)
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=FakeYOLO, __version__="0"))
+    result = vbs.evaluate_checkpoint(
+        checkpoint=tmp_path / "yolov9.pt",
+        cfg_path=tmp_path / "cfg.yaml",
+        model_cfg=None,
+        hardware_cfg=None,
+        run_cfg=None,
+        split="val",
+        execute=True,
+        out_dir=out_dir,
+    )
+    assert result["metrics"]["precision"] == 1
+    assert (out_dir / "raw" / "predictions.json").exists()
+    assert not (out_dir / "raw" / "raw").exists()
+    assert not (out_dir / "raw" / "val" / "raw").exists()
+    assert (out_dir / "completed.marker").exists()
