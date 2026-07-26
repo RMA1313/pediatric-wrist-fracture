@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from scripts import benchmark, gpu_preflight, train, transfer_manifest
@@ -384,7 +385,7 @@ def test_train_execute_gpu_succeeds_with_mocked_cuda(
     exp = _write_composed_bundle(tmp_path, hardware_device="cuda:0", model_family="yolov8")
     monkeypatch.setattr(train, "_cuda_is_available", lambda: True)
     monkeypatch.setattr(train, "_cuda_device_exists", lambda device: True)
-    monkeypatch.setattr(train, "_execute_training", lambda cfg, root: None)
+    monkeypatch.setattr(train, "_execute_training_with_args", lambda cfg, root, args: None)
     monkeypatch.setattr(train, "persist_run_metadata", lambda *a, **k: None)
     monkeypatch.setattr(train, "finalize_run", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -409,6 +410,180 @@ def test_train_execute_gpu_succeeds_with_mocked_cuda(
         )(),
     )
     assert train.main() is None
+
+
+def test_device_normalization():
+    assert train._normalize_device("cuda:0") == "0"
+    assert train._normalize_device("cuda") == "0"
+    assert train._normalize_device("cpu") == "cpu"
+
+
+def test_ultralytics_argument_mapping_preserves_smoke_values(monkeypatch: pytest.MonkeyPatch):
+    cfg = ExperimentConfig(
+        dataset_yaml=Path("data/dataset.yaml"),
+        dataset_split_yaml=None,
+        model=ModelConfig("yolov8", "yolov8n.pt", "n"),
+        hardware=HardwareConfig(
+            device="cuda:0",
+            amp=True,
+            workers=8,
+            cache="disk",
+            deterministic=False,
+        ),
+        run=RunConfig(name="smoke", output_root=Path("outputs"), save_period=3),
+        image_size=320,
+        epochs=1,
+        patience=1,
+        seed=42,
+        optimizer="SGD",
+        lr0=0.02,
+        lrf=0.1,
+        weight_decay=0.001,
+        augmentation={"mosaic": 0.0, "mixup": 0.0},
+        batch_size=4,
+    )
+    root = Path("C:/tmp/run")
+    root.mkdir(parents=True, exist_ok=True)
+    captured: dict[str, object] = {}
+
+    class FakeYOLO:
+        def __init__(self, checkpoint: str):
+            captured["checkpoint"] = checkpoint
+            self.trainer = SimpleNamespace(save_dir=root / "raw" / "train")
+
+        def train(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return {"ok": True}
+
+    fake_ultralytics = ModuleType("ultralytics")
+    fake_ultralytics.YOLO = FakeYOLO
+    monkeypatch.setitem(train.sys.modules, "ultralytics", fake_ultralytics)
+    monkeypatch.setattr(train, "_read_csv_rows", lambda path: [])
+    monkeypatch.setattr(
+        train, "_collect_checkpoint_paths", lambda save_dir: {"best": None, "last": None}
+    )
+    monkeypatch.setattr(train, "_maybe_copy_or_link", lambda src, dst: dst)
+    monkeypatch.setattr(train, "_write_csv_rows", lambda *a, **k: None)
+    monkeypatch.setattr(train, "_write_validation_json", lambda *a, **k: None)
+    monkeypatch.setattr(train, "_write_run_summary", lambda *a, **k: None)
+    monkeypatch.setattr(train, "write_atomic", lambda *a, **k: None)
+    monkeypatch.setattr(
+        train, "resolve_model_spec", lambda model: SimpleNamespace(checkpoint="yolov8n.pt")
+    )
+    with pytest.raises(ConfigError, match="missing expected Ultralytics checkpoints"):
+        train._execute_training_with_args(cfg, root, SimpleNamespace(execute=True, smoke=True))
+    assert captured["checkpoint"] == "yolov8n.pt"
+    assert captured["kwargs"]["imgsz"] == 320
+    assert captured["kwargs"]["epochs"] == 1
+    assert captured["kwargs"]["batch"] == 4
+    assert captured["kwargs"]["workers"] == 8
+    assert captured["kwargs"]["device"] == "0"
+    assert captured["kwargs"]["amp"] is True
+    assert captured["kwargs"]["seed"] == 42
+    assert captured["kwargs"]["deterministic"] is False
+    assert captured["kwargs"]["optimizer"] == "SGD"
+    assert captured["kwargs"]["lr0"] == 0.02
+    assert captured["kwargs"]["lrf"] == 0.1
+    assert captured["kwargs"]["weight_decay"] == 0.001
+    assert captured["kwargs"]["cache"] == "disk"
+    assert captured["kwargs"]["save_period"] == 3
+    assert captured["kwargs"]["mosaic"] == 0.0
+    assert captured["kwargs"]["mixup"] == 0.0
+
+
+def test_checkpoint_collection_and_metric_normalization(tmp_path: Path):
+    save_dir = tmp_path / "raw" / "train"
+    weights = save_dir / "weights"
+    weights.mkdir(parents=True)
+    (weights / "best.pt").write_text("best", encoding="utf-8")
+    (weights / "last.pt").write_text("last", encoding="utf-8")
+    (save_dir / "results.csv").write_text(
+        "epoch,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "0,0.1,0.2,0.3,0.4\n"
+        "1,0.5,0.6,0.7,0.8\n",
+        encoding="utf-8",
+    )
+    checkpoints = train._collect_checkpoint_paths(save_dir)
+    assert checkpoints["best"] == weights / "best.pt"
+    assert checkpoints["last"] == weights / "last.pt"
+    rows = train._normalize_history(train._read_csv_rows(save_dir / "results.csv"))
+    metrics = train._metrics_from_history(rows)
+    assert metrics["best_epoch"] == 1
+    assert metrics["best_map50_95"] == 0.8
+    assert metrics["final_precision"] == 0.5
+    assert metrics["final_recall"] == 0.6
+    assert metrics["final_map50"] == 0.7
+    assert metrics["final_map50_95"] == 0.8
+
+
+def test_interrupt_and_completion_markers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = load_config_bundle(_write_bundle(tmp_path))
+    root = tmp_path / "run"
+    root.mkdir()
+    monkeypatch.setattr(
+        train,
+        "_execute_training_with_args",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(train, "persist_run_metadata", lambda *a, **k: None)
+    monkeypatch.setattr(train, "ensure_unique_run_dir", lambda *a, **k: None)
+    monkeypatch.setattr(train, "build_run_id", lambda cfg: "run1")
+    monkeypatch.setattr(train, "run_root", lambda cfg, run_id: root)
+    monkeypatch.setattr(
+        train.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: type(
+            "Args",
+            (),
+            {
+                "config": str(tmp_path / "experiment.yaml"),
+                "model_config": None,
+                "hardware_config": None,
+                "run_config": None,
+                "dry_run": False,
+                "preflight": False,
+                "smoke": False,
+                "execute": True,
+                "resume": False,
+                "allow_cpu_smoke": True,
+                "print_resolved_config": False,
+            },
+        )(),
+    )
+    monkeypatch.setattr(train, "resolve_config", lambda args: cfg)
+    with pytest.raises(RuntimeError, match="boom"):
+        train.main()
+    assert (root / "interrupted.marker").exists()
+
+
+def test_dry_run_reports_resolved_smoke_imgsz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    exp, smoke = _write_smoke_overlay_bundle(tmp_path)
+    monkeypatch.setattr(
+        train.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: type(
+            "Args",
+            (),
+            {
+                "config": str(exp),
+                "model_config": None,
+                "hardware_config": None,
+                "run_config": str(smoke),
+                "dry_run": True,
+                "preflight": False,
+                "smoke": True,
+                "execute": False,
+                "resume": False,
+                "allow_cpu_smoke": False,
+                "print_resolved_config": False,
+            },
+        )(),
+    )
+    train.main()
+    out = capsys.readouterr().out
+    assert '"imgsz": 320' in out
 
 
 def test_gpu_preflight_cpu_mode(

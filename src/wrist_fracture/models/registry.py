@@ -67,14 +67,14 @@ def resolve_model_spec(model: ModelConfig) -> ModelSpec:
     return spec
 
 
-def describe_model_spec(spec: ModelSpec) -> dict[str, object]:
+def describe_model_spec(spec: ModelSpec, *, imgsz: int | None = None) -> dict[str, object]:
     return {
         "family": spec.family,
         "checkpoint": spec.checkpoint,
         "scale": spec.scale,
         "params_m": spec.params_m,
         "flops_b": spec.flops_b,
-        "imgsz": spec.imgsz,
+        "imgsz": spec.imgsz if imgsz is None else imgsz,
         "nms_free_default": spec.nms_free_default,
         "requires_external_repo": spec.requires_external_repo,
     }
