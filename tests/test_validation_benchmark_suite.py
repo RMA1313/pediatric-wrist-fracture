@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 from scripts import benchmark, evaluate
 from scripts import run_validation_benchmark_suite as suite
 
@@ -13,8 +14,10 @@ from wrist_fracture.config import ConfigError
 from wrist_fracture.validation_benchmark_suite import (
     _percentile,
     _summary_stats,
+    build_benchmark_image_manifest,
     resolve_checkpoint_path,
     select_runs,
+    validate_benchmark_image_manifest,
 )
 
 
@@ -262,7 +265,6 @@ def test_smoke_suite_model_records_preserve_checkpoint_metadata(
         "benchmark_checkpoint",
         lambda **kwargs: {"latency": {"mean": 1.0}, "complexity": {}},
     )
-    monkeypatch.setattr(suite, "deterministic_sample_manifest", lambda images, samples: [])
     monkeypatch.setattr(suite, "discover_source_runs", lambda _: records)
     monkeypatch.setattr(suite, "collect_environment_report", lambda _: {})
     monkeypatch.setattr(suite, "git_commit", lambda _: None)
@@ -281,3 +283,164 @@ def test_smoke_suite_model_records_preserve_checkpoint_metadata(
     assert [row["checkpoint_sha256"] for row in summary["models"]] == [
         rec["checkpoint_sha256"] for rec in records
     ]
+
+
+def _write_image(path: Path, color: tuple[int, int, int] = (255, 0, 0)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.new("RGB", (8, 8), color=color)
+    img.save(path)
+
+
+def test_benchmark_manifest_excludes_non_images(tmp_path: Path):
+    images_root = tmp_path / "data/processed/yolo/images"
+    val_root = images_root / "val"
+    _write_image(val_root / "a.png")
+    _write_image(val_root / "b.jpg")
+    _write_image(val_root / "c.tiff")
+    (val_root / "sample.npy").write_bytes(b"npy")
+    (val_root / "labels.txt").write_text("label", encoding="utf-8")
+    (val_root / "meta.json").write_text("{}", encoding="utf-8")
+    (val_root / ".hidden.png").write_bytes(b"hidden")
+    (val_root / "zero.png").write_bytes(b"")
+    broken = val_root / "broken.png"
+    try:
+        broken.symlink_to(val_root / "missing.png")
+    except OSError:
+        pytest.skip("symlinks unavailable on this platform")
+    manifest = build_benchmark_image_manifest(images_root, split="val", samples=10)
+    assert manifest["selected_sample_count"] == 3
+    assert manifest["candidate_count"] >= 8
+    assert manifest["excluded_file_counts"]["unsupported_suffix"] >= 4
+    assert manifest["excluded_file_counts"]["zero_byte"] == 1
+    assert manifest["excluded_file_counts"]["broken_link"] == 1
+    assert manifest["excluded_file_counts"]["hidden"] == 1
+    assert manifest["selected_samples"] == ["val/a.png", "val/b.jpg", "val/c.tiff"]
+
+
+def test_validate_benchmark_manifest_rejects_stale_entries(tmp_path: Path):
+    images_root = tmp_path / "data/processed/yolo/images"
+    val_root = images_root / "val"
+    _write_image(val_root / "a.png")
+    manifest = build_benchmark_image_manifest(images_root, split="val", samples=1)
+    manifest["selected_samples"] = ["val/missing.png"]
+    issues = validate_benchmark_image_manifest(manifest, images_root, "val")
+    assert issues
+
+
+def test_manifest_is_deterministic_and_shared_across_models(tmp_path: Path):
+    images_root = tmp_path / "data/processed/yolo/images"
+    val_root = images_root / "val"
+    for name in ["c.png", "a.jpg", "b.tiff"]:
+        _write_image(val_root / name)
+    first = build_benchmark_image_manifest(images_root, split="val", samples=2, seed=0)
+    second = build_benchmark_image_manifest(images_root, split="val", samples=2, seed=0)
+    assert first["selected_samples"] == second["selected_samples"]
+    assert first["selected_samples"] == ["val/a.jpg", "val/b.tiff"]
+
+
+def test_suite_regenerates_stale_manifest_and_resolves_output_paths(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "suite_summary.json").write_text(
+        json.dumps({"models": [{"model_family": "yolov8", "checkpoint": "x.pt", "run_path": "r"}]}),
+        encoding="utf-8",
+    )
+    images_root = tmp_path / "data/processed/yolo/images/val"
+    _write_image(images_root / "a.png")
+    monkeypatch.chdir(tmp_path)
+    suite_dir = tmp_path / "outputs/validation_benchmark_suites/suite"
+    suite_dir.mkdir(parents=True)
+    (suite_dir / "benchmark_image_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "split": "val",
+                "images_root": str((tmp_path / "data/processed/yolo/images").resolve()),
+                "allowed_image_suffixes": [".png"],
+                "selected_samples": ["val/missing.png"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        suite.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: SimpleNamespace(
+            source_suite=str(source),
+            dry_run=False,
+            execute=True,
+            suite_id="suite",
+            models="yolov8",
+            skip_completed=True,
+            continue_on_error=True,
+            resume=True,
+            force=False,
+            warmup=0,
+            samples=1,
+            benchmark_batch_size=1,
+            io_workers=0,
+            print_commands=False,
+        ),
+    )
+    monkeypatch.setattr(
+        suite,
+        "discover_source_runs",
+        lambda _: [{"model_family": "yolov8", "checkpoint": "x.pt", "run_path": "r"}],
+    )
+    monkeypatch.setattr(
+        suite,
+        "resolve_checkpoint_path",
+        lambda *args, **kwargs: SimpleNamespace(
+            source="x.pt",
+            candidates=("x.pt",),
+            selected=str(tmp_path / "x.pt"),
+            sha256=None,
+        ),
+    )
+    (tmp_path / "x.pt").write_bytes(b"model")
+    monkeypatch.setattr(
+        suite,
+        "evaluate_checkpoint",
+        lambda **kwargs: {
+            "metrics": {
+                "precision": 1,
+                "recall": 1,
+                "f1": 1,
+                "map50": 1,
+                "map50_95": 1,
+                "validation_duration_seconds": 1,
+                "preprocess_time_ms": 1,
+                "inference_time_ms": 1,
+                "postprocess_time_ms": 1,
+                "loss_time_ms": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        suite,
+        "benchmark_checkpoint",
+        lambda **kwargs: {
+            "latency": {
+                "mean": 1,
+                "median": 1,
+                "std": 0,
+                "min": 1,
+                "max": 1,
+                "p90": 1,
+                "p95": 1,
+                "p99": 1,
+                "throughput": 1,
+            },
+            "complexity": {},
+        },
+    )
+    monkeypatch.setattr(suite, "collect_environment_report", lambda _: {})
+    monkeypatch.setattr(suite, "git_commit", lambda _: None)
+    monkeypatch.setattr(suite, "git_dirty", lambda _: False)
+    monkeypatch.setattr(suite, "to_jsonable", lambda value: value)
+    assert suite.main() == 0
+    regenerated = json.loads(
+        (suite_dir / "benchmark_image_manifest.json").read_text(encoding="utf-8")
+    )
+    assert regenerated["selected_sample_count"] == 1
+    assert (tmp_path / "outputs/validation_benchmark_suites/suite/suite_summary.json").exists()

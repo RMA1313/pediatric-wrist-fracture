@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import time
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from wrist_fracture.runtime import normalize_device, normalize_json_value
 
 SCHEMA_VERSION = 1
 MODEL_ORDER = ("yolov8", "yolov9", "yolo26")
+FALLBACK_IMAGE_SUFFIXES = (".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp")
+MANIFEST_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,148 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def _json_safe(value: Any) -> Any:
     return normalize_json_value(value)
+
+
+def _ultralytics_image_suffixes() -> tuple[str, ...]:
+    try:
+        from ultralytics.utils import files as ultralytics_files  # type: ignore
+
+        suffixes = getattr(ultralytics_files, "IMG_FORMATS", None)
+        if suffixes:
+            return tuple(sorted({f".{suffix.lower().lstrip('.')}" for suffix in suffixes}))
+    except Exception:
+        pass
+    return FALLBACK_IMAGE_SUFFIXES
+
+
+def supported_image_suffixes() -> tuple[str, ...]:
+    return _ultralytics_image_suffixes()
+
+
+def _is_hidden(path: Path) -> bool:
+    return any(part.startswith(".") for part in path.parts)
+
+
+def _readable_image(path: Path) -> bool:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        pass
+    try:
+        import cv2
+
+        return cv2.imread(str(path)) is not None
+    except Exception:
+        return False
+
+
+def _manifest_hash(payload: dict[str, Any]) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _split_root(images_root: Path, split: str) -> Path:
+    if images_root.name == split:
+        return images_root
+    return images_root / split
+
+
+def build_benchmark_image_manifest(
+    images_root: Path,
+    *,
+    split: str = "val",
+    samples: int,
+    seed: int = 0,
+) -> dict[str, Any]:
+    split_root = _split_root(images_root, split)
+    allowed_suffixes = supported_image_suffixes()
+    exclusions = Counter()
+    valid: list[Path] = []
+    candidate_count = 0
+    for path in sorted(split_root.rglob("*"), key=lambda p: p.as_posix().lower()):
+        candidate_count += 1
+        rel = path.relative_to(images_root)
+        if _is_hidden(rel):
+            exclusions["hidden"] += 1
+            continue
+        if path.is_dir():
+            exclusions["directory"] += 1
+            continue
+        if path.is_symlink() and not path.exists():
+            exclusions["broken_link"] += 1
+            continue
+        if not path.exists():
+            exclusions["missing"] += 1
+            continue
+        if not path.is_file():
+            exclusions["non_regular_file"] += 1
+            continue
+        if path.stat().st_size <= 0:
+            exclusions["zero_byte"] += 1
+            continue
+        if path.suffix.lower() not in allowed_suffixes:
+            exclusions["unsupported_suffix"] += 1
+            continue
+        if not _readable_image(path):
+            exclusions["unreadable"] += 1
+            continue
+        valid.append(path)
+    selected = deterministic_sample_manifest(valid, samples)
+    payload = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "split": split,
+        "images_root": str(images_root.resolve()),
+        "split_root": str(split_root.resolve()),
+        "allowed_image_suffixes": list(allowed_suffixes),
+        "candidate_count": candidate_count,
+        "excluded_file_counts": dict(sorted(exclusions.items())),
+        "selected_sample_count": len(selected),
+        "seed": seed,
+        "selected_samples": [str(path.relative_to(images_root).as_posix()) for path in selected],
+    }
+    payload["manifest_hash"] = _manifest_hash(payload)
+    return payload
+
+
+def validate_benchmark_image_manifest(
+    manifest: dict[str, Any], images_root: Path, split: str = "val"
+) -> list[str]:
+    issues: list[str] = []
+    expected_suffixes = list(supported_image_suffixes())
+    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        issues.append("schema version mismatch")
+    if manifest.get("allowed_image_suffixes") != expected_suffixes:
+        issues.append("allowed suffixes mismatch")
+    if manifest.get("split") != split:
+        issues.append("split mismatch")
+    if manifest.get("images_root") != str(images_root.resolve()):
+        issues.append("images root mismatch")
+    selected = manifest.get("selected_samples")
+    if not isinstance(selected, list) or not selected:
+        issues.append("missing selected samples")
+        return issues
+    for rel in selected:
+        path = images_root / rel
+        if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+            issues.append(f"invalid sample: {rel}")
+            break
+        if path.suffix.lower() not in expected_suffixes:
+            issues.append(f"unsupported sample suffix: {rel}")
+            break
+        if _is_hidden(path.relative_to(images_root)):
+            issues.append(f"hidden sample: {rel}")
+            break
+        if not _readable_image(path):
+            issues.append(f"unreadable sample: {rel}")
+            break
+    return issues
 
 
 def _to_float(value: Any) -> float | None:
@@ -289,6 +434,7 @@ def evaluate_checkpoint(
         raise ConfigError(f"unsupported split: {split}")
     if cfg.model.family not in checkpoint.as_posix():
         raise ConfigError("checkpoint/config model-family mismatch")
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=False)
     resolved = {
         "dataset_yaml": str(cfg.dataset_yaml),
@@ -340,7 +486,7 @@ def evaluate_checkpoint(
         max_det=resolved["max_det"],
         plots=True,
         save_json=True,
-        project=str(out_dir / "raw"),
+        project=str((out_dir / "raw").resolve()),
         name="val",
         exist_ok=True,
         verbose=False,
@@ -445,6 +591,7 @@ def benchmark_checkpoint(
     execute: bool,
     out_dir: Path,
 ) -> dict[str, Any]:
+    out_dir = out_dir.resolve()
     if not execute:
         return {"planned": True, "checkpoint": str(checkpoint), "samples": samples}
     cfg = load_config_bundle(

@@ -4,7 +4,10 @@ import argparse
 from pathlib import Path
 
 from wrist_fracture.config import ConfigError, load_config_bundle, validate_experiment_config
-from wrist_fracture.validation_benchmark_suite import benchmark_checkpoint
+from wrist_fracture.validation_benchmark_suite import (
+    benchmark_checkpoint,
+    build_benchmark_image_manifest,
+)
 
 
 def main() -> None:
@@ -42,7 +45,7 @@ def main() -> None:
         Path(args.output_dir)
         if args.output_dir
         else Path("outputs/benchmarks") / (args.benchmark_id or checkpoint.stem)
-    )
+    ).resolve()
     print(
         {
             "config": args.config,
@@ -58,7 +61,10 @@ def main() -> None:
         return
     if out_dir.exists():
         raise ConfigError(f"output collision: {out_dir}")
-    images = sorted((Path("data/processed/yolo/images/val")).glob("*"))
+    manifest = build_benchmark_image_manifest(
+        Path("data/processed/yolo/images"), split="val", samples=args.samples
+    )
+    images = [Path("data/processed/yolo/images") / rel for rel in manifest["selected_samples"]]
     benchmark_checkpoint(
         checkpoint=checkpoint,
         images=images,

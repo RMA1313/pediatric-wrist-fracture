@@ -14,11 +14,12 @@ from wrist_fracture.provenance import collect_environment_report, git_commit, gi
 from wrist_fracture.validation_benchmark_suite import (
     MODEL_ORDER,
     benchmark_checkpoint,
-    deterministic_sample_manifest,
+    build_benchmark_image_manifest,
     discover_source_runs,
     evaluate_checkpoint,
     resolve_checkpoint_path,
     select_runs,
+    validate_benchmark_image_manifest,
     validate_required_numeric_fields,
 )
 
@@ -102,6 +103,34 @@ def _finish_marker(path: Path, ok: bool) -> None:
 
 def _sample_manifest(rows: list[Path]) -> list[dict[str, Any]]:
     return [{"order": i + 1, "image_path": str(path)} for i, path in enumerate(rows)]
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _can_resume(output_dir: Path, marker_name: str) -> bool:
+    return (output_dir / marker_name).exists()
+
+
+def _load_eval_metrics(out_dir: Path) -> dict[str, Any] | None:
+    payload = _load_json(out_dir / "metrics.json")
+    if not payload:
+        return None
+    return {"metrics": payload}
+
+
+def _load_benchmark_result(out_dir: Path) -> dict[str, Any] | None:
+    payload = _load_json(out_dir / "benchmark.json")
+    if not payload:
+        return None
+    return {
+        "latency": payload.get("latency_seconds", {}),
+        "complexity": payload.get("complexity", {}),
+        "selected_images": payload.get("sample_manifest", []),
+    }
 
 
 def _require_valid_metrics(result: ModelResult) -> list[str]:
@@ -213,8 +242,25 @@ def main() -> int:
     commands: list[str] = []
     diagnostics: list[str] = []
     sample_manifest: list[dict[str, Any]] = []
+    manifest_reason: str | None = None
     rows: list[ModelResult] = []
     benchmark_sample_paths: list[Path] | None = None
+    benchmark_manifest_path = suite_dir / "benchmark_image_manifest.json"
+    manifest_images_root = Path("data/processed/yolo/images")
+    manifest = _load_json(benchmark_manifest_path)
+    if manifest is not None:
+        issues = validate_benchmark_image_manifest(manifest, manifest_images_root, "val")
+        if issues:
+            manifest_reason = "; ".join(issues)
+            manifest = None
+    if manifest is None:
+        manifest = build_benchmark_image_manifest(
+            manifest_images_root, split="val", samples=args.samples, seed=0
+        )
+        manifest["invalidated_previous_manifest_reason"] = manifest_reason
+        _atomic_write(benchmark_manifest_path, manifest)
+    benchmark_sample_paths = [manifest_images_root / rel for rel in manifest["selected_samples"]]
+    sample_manifest = _sample_manifest(benchmark_sample_paths)
 
     try:
         for run in source_runs:
@@ -240,33 +286,41 @@ def main() -> int:
                 commands.append(
                     f"uv run python scripts/benchmark.py --execute --checkpoint {checkpoint}"
                 )
-            eval_result = evaluate_checkpoint(
-                checkpoint=checkpoint,
-                cfg_path=Path("configs/experiment.yaml"),
-                model_cfg=Path(f"configs/models/{model_family}.yaml"),
-                hardware_cfg=Path("configs/hardware/rtx4090.yaml"),
-                run_cfg=Path("configs/runs/smoke.yaml"),
-                split="val",
-                execute=True,
-                out_dir=eval_dir,
+            eval_result = (
+                _load_eval_metrics(eval_dir)
+                if args.resume and _can_resume(eval_dir, "completed.marker")
+                else None
             )
-            images = sorted((Path("data/processed/yolo/images/val")).glob("*"))
-            if benchmark_sample_paths is None:
-                benchmark_sample_paths = deterministic_sample_manifest(images, args.samples)
-                sample_manifest = _sample_manifest(benchmark_sample_paths)
-            bench_result = benchmark_checkpoint(
-                checkpoint=checkpoint,
-                images=benchmark_sample_paths,
-                cfg_path=Path("configs/experiment.yaml"),
-                model_cfg=Path(f"configs/models/{model_family}.yaml"),
-                hardware_cfg=Path("configs/hardware/rtx4090.yaml"),
-                run_cfg=Path("configs/runs/smoke.yaml"),
-                warmup=args.warmup,
-                samples=args.samples,
-                batch_size=args.benchmark_batch_size,
-                execute=True,
-                out_dir=bench_dir,
+            if eval_result is None:
+                eval_result = evaluate_checkpoint(
+                    checkpoint=checkpoint,
+                    cfg_path=Path("configs/experiment.yaml"),
+                    model_cfg=Path(f"configs/models/{model_family}.yaml"),
+                    hardware_cfg=Path("configs/hardware/rtx4090.yaml"),
+                    run_cfg=Path("configs/runs/smoke.yaml"),
+                    split="val",
+                    execute=True,
+                    out_dir=eval_dir,
+                )
+            bench_result = (
+                _load_benchmark_result(bench_dir)
+                if args.resume and _can_resume(bench_dir, "completed.marker")
+                else None
             )
+            if bench_result is None:
+                bench_result = benchmark_checkpoint(
+                    checkpoint=checkpoint,
+                    images=benchmark_sample_paths,
+                    cfg_path=Path("configs/experiment.yaml"),
+                    model_cfg=Path(f"configs/models/{model_family}.yaml"),
+                    hardware_cfg=Path("configs/hardware/rtx4090.yaml"),
+                    run_cfg=Path("configs/runs/smoke.yaml"),
+                    warmup=args.warmup,
+                    samples=args.samples,
+                    batch_size=args.benchmark_batch_size,
+                    execute=True,
+                    out_dir=bench_dir,
+                )
             metrics = eval_result["metrics"]
             bench_stats = bench_result["latency"]
             result = ModelResult(
@@ -422,6 +476,11 @@ def main() -> int:
         writer = csv.DictWriter(fh, fieldnames=["order", "image_path"])
         writer.writeheader()
         writer.writerows(sample_manifest)
+    if manifest_reason:
+        _atomic_write(
+            suite_dir / "benchmark_image_manifest_invalidation.json",
+            {"reason": manifest_reason, "regenerated": True},
+        )
     _atomic_write(suite_dir / "stage_timings.json", timings)
     if ok:
         _finish_marker(suite_dir / "completed.marker", True)

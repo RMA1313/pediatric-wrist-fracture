@@ -41,7 +41,7 @@ def main() -> None:
         Path(args.output_dir)
         if args.output_dir
         else Path("outputs/evaluations") / (args.evaluation_id or checkpoint.stem)
-    )
+    ).resolve()
     plan = {
         "config": args.config,
         "checkpoint": str(checkpoint),
