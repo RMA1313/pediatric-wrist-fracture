@@ -22,6 +22,12 @@ from wrist_fracture.provenance import (
 )
 
 
+@dataclasses.dataclass(frozen=True)
+class ExecutionOptions:
+    execute: bool = False
+    smoke: bool = False
+
+
 def now_utc() -> str:
     from datetime import UTC, datetime
 
@@ -188,6 +194,13 @@ def _collect_checkpoint_paths(save_dir: Path) -> dict[str, Path | None]:
     return {"best": best if best.exists() else None, "last": last if last.exists() else None}
 
 
+def _find_ultralytics_save_dir(raw_root: Path) -> Path:
+    candidates = sorted(raw_root.glob("**/results.csv"))
+    if not candidates:
+        raise ConfigError("no raw Ultralytics results.csv found for recovery")
+    return candidates[0].parent
+
+
 def _validate_results_csv_columns(rows: list[dict[str, str]]) -> None:
     if not rows:
         raise ConfigError("results.csv is empty")
@@ -297,7 +310,7 @@ def write_run_summary(
     root: Path,
     *,
     cfg: ExperimentConfig,
-    args: argparse.Namespace,
+    options: ExecutionOptions,
     started_at: str,
     ended_at: str,
     duration_seconds: float,
@@ -305,6 +318,7 @@ def write_run_summary(
     history_rows: list[dict[str, Any]],
     checkpoints: dict[str, Path | None],
     gpu_peak_memory_bytes: int | None,
+    effective_protocol: dict[str, Any] | None = None,
 ) -> None:
     metrics = _metrics_from_history(history_rows)
     payload = {
@@ -319,8 +333,9 @@ def write_run_summary(
         },
         "ultralytics_save_dir": str(save_dir),
         "config": config_to_dict(cfg),
-        "execute": args.execute,
-        "smoke": args.smoke,
+        "execute": options.execute,
+        "smoke": options.smoke,
+        "effective_protocol": normalize_json_value(effective_protocol),
         **metrics,
     }
     write_atomic(
@@ -330,11 +345,8 @@ def write_run_summary(
 
 
 def recover_training_artifacts(root: Path) -> None:
-    raw_candidates = sorted((root / "raw").glob("**/results.csv"))
-    if not raw_candidates:
-        raise ConfigError("no raw Ultralytics results.csv found for recovery")
-    history_src = raw_candidates[0]
-    save_dir = history_src.parent
+    save_dir = _find_ultralytics_save_dir(root / "raw")
+    history_src = save_dir / "results.csv"
     rows = _read_csv_rows(history_src)
     _validate_results_csv_columns(rows)
     history_rows = _normalize_history(rows)
@@ -367,7 +379,8 @@ def recover_training_artifacts(root: Path) -> None:
         "ultralytics_save_dir": str(save_dir),
         "config": None,
         "execute": True,
-        "smoke": True,
+        "smoke": False,
+        "effective_protocol": None,
         **metrics,
     }
     write_atomic(
@@ -378,6 +391,38 @@ def recover_training_artifacts(root: Path) -> None:
     if interrupted.exists():
         interrupted.unlink()
     (root / "completed.marker").write_text(now_utc(), encoding="utf-8")
+
+
+def _capture_effective_protocol(results: Any, train_kwargs: dict[str, Any]) -> dict[str, Any]:
+    trainer = getattr(results, "trainer", None)
+    args_obj = getattr(trainer, "args", None)
+    effective = {
+        "optimizer": getattr(args_obj, "optimizer", None),
+        "lr0": getattr(args_obj, "lr0", None),
+        "momentum": getattr(args_obj, "momentum", None),
+        "augmentation": {
+            "RandAugment": getattr(args_obj, "auto_augment", None),
+            "erasing": getattr(args_obj, "erasing", None),
+            "horizontal_flip": getattr(args_obj, "fliplr", None),
+            "translate": getattr(args_obj, "translate", None),
+            "scale": getattr(args_obj, "scale", None),
+        },
+    }
+    if not effective["optimizer"]:
+        effective["optimizer"] = train_kwargs.get("optimizer")
+    if effective["lr0"] is None:
+        effective["lr0"] = train_kwargs.get("lr0")
+    if effective["augmentation"]["horizontal_flip"] is None:
+        effective["augmentation"]["horizontal_flip"] = train_kwargs.get("fliplr")
+    if effective["augmentation"]["translate"] is None:
+        effective["augmentation"]["translate"] = train_kwargs.get("translate")
+    if effective["augmentation"]["scale"] is None:
+        effective["augmentation"]["scale"] = train_kwargs.get("scale")
+    if effective["augmentation"]["erasing"] is None:
+        effective["augmentation"]["erasing"] = train_kwargs.get("erasing")
+    if effective["augmentation"]["RandAugment"] is None:
+        effective["augmentation"]["RandAugment"] = train_kwargs.get("auto_augment")
+    return effective
 
 
 def persist_run_metadata(root: Path, cfg: ExperimentConfig, args: argparse.Namespace) -> None:
@@ -432,7 +477,7 @@ def execute_training_with_args(cfg: ExperimentConfig, root: Path, args: argparse
         "weight_decay": cfg.weight_decay,
         "cache": cfg.hardware.cache,
         "save_period": cfg.run.save_period,
-        "project": str(root / "raw"),
+        "project": str((root / "raw").resolve()),
         "name": "train",
         "exist_ok": True,
         "pretrained": cfg.pretrained,
@@ -477,6 +522,7 @@ def execute_training_with_args(cfg: ExperimentConfig, root: Path, args: argparse
         actual_last = _maybe_copy_or_link(last_src, last_dst) if last_src else None
         if actual_best is None or actual_last is None:
             raise ConfigError("missing expected Ultralytics checkpoints")
+        effective_protocol = _capture_effective_protocol(results, train_kwargs)
         gpu_peak_memory_bytes = None
         try:
             import torch
@@ -510,7 +556,10 @@ def execute_training_with_args(cfg: ExperimentConfig, root: Path, args: argparse
         write_run_summary(
             root,
             cfg=cfg,
-            args=args,
+            options=ExecutionOptions(
+                execute=bool(getattr(args, "execute", False)),
+                smoke=bool(getattr(args, "smoke", False)),
+            ),
             started_at=started_at,
             ended_at=ended_at,
             duration_seconds=duration_seconds,
@@ -518,6 +567,7 @@ def execute_training_with_args(cfg: ExperimentConfig, root: Path, args: argparse
             history_rows=history_rows,
             checkpoints={"best": actual_best, "last": actual_last},
             gpu_peak_memory_bytes=gpu_peak_memory_bytes,
+            effective_protocol=effective_protocol,
         )
         (root / "completed.marker").write_text(now_utc(), encoding="utf-8")
     except Exception:

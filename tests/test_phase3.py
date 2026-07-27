@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 from scripts import benchmark, gpu_preflight, train, transfer_manifest
 
+from wrist_fracture import runtime
 from wrist_fracture.config import (
     ConfigError,
     ExperimentConfig,
@@ -912,3 +916,116 @@ def test_merge_precedence_is_deterministic(tmp_path: Path):
 def test_model_registry_resolution_without_downloads():
     spec = resolve_model_spec(ModelConfig("yolo26", "yolo26n.pt", "n"))
     assert spec.checkpoint == "yolo26n.pt"
+
+
+def test_runtime_write_run_summary_smoke_default_and_smoke_true(tmp_path: Path):
+    cfg = ExperimentConfig(
+        dataset_yaml=tmp_path / "dataset.yaml",
+        dataset_split_yaml=None,
+        model=ModelConfig("yolo26", "yolo26n.pt", "n"),
+        hardware=HardwareConfig(device="cpu", allow_cpu_training=True),
+        run=RunConfig(
+            name="r",
+            output_root=tmp_path / "out",
+            resume=False,
+            validation_split="val",
+            test_split="test",
+        ),
+        image_size=320,
+        epochs=1,
+        batch_size=1,
+    )
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "metrics").mkdir(parents=True, exist_ok=True)
+    runtime.write_run_summary(
+        root,
+        cfg=cfg,
+        options=runtime.ExecutionOptions(execute=True, smoke=True),
+        started_at="s",
+        ended_at="e",
+        duration_seconds=1.0,
+        save_dir=root / "raw/train",
+        history_rows=[
+            {
+                "epoch": 1,
+                "metrics/precision(B)": 0.1,
+                "metrics/recall(B)": 0.2,
+                "metrics/mAP50(B)": 0.3,
+                "metrics/mAP50-95(B)": 0.4,
+            }
+        ],
+        checkpoints={"best": root / "checkpoints/best.pt", "last": root / "checkpoints/last.pt"},
+        gpu_peak_memory_bytes=1,
+    )
+    payload = json.loads((root / "metrics/run_summary.json").read_text(encoding="utf-8"))
+    assert payload["smoke"] is True
+    assert payload["execute"] is True
+
+
+def test_execute_training_uses_absolute_project_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = ExperimentConfig(
+        dataset_yaml=tmp_path / "dataset.yaml",
+        dataset_split_yaml=None,
+        model=ModelConfig("yolo26", "yolo26n.pt", "n"),
+        hardware=HardwareConfig(device="cpu", allow_cpu_training=True),
+        run=RunConfig(
+            name="r",
+            output_root=tmp_path / "out",
+            resume=False,
+            validation_split="val",
+            test_split="test",
+        ),
+        image_size=320,
+        epochs=1,
+        batch_size=1,
+    )
+    cfg.dataset_yaml.write_text(
+        "path: data\ntrain: train\nval: val\ntest: test\nnames: {0: fracture}\n"
+    )
+    root = tmp_path / "run"
+    root.mkdir()
+    captured: dict[str, Any] = {}
+
+    class DummyTrainer:
+        save_dir = root / "raw/train"
+        args = SimpleNamespace(
+            optimizer="MuSGD",
+            lr0=0.01,
+            momentum=0.937,
+            auto_augment="randaugment",
+            erasing=0.4,
+            fliplr=0.5,
+            translate=0.1,
+            scale=0.5,
+        )
+
+    class DummyResults:
+        fitness = 0.1
+        maps = [0.1]
+        speed = {"infer": 1}
+        trainer = DummyTrainer()
+
+    class DummyYOLO:
+        def __init__(self, checkpoint):
+            self.checkpoint = checkpoint
+            self.trainer = DummyTrainer()
+
+        def train(self, **kwargs):
+            captured.update(kwargs)
+            self.trainer = DummyTrainer()
+            (root / "raw/train/weights").mkdir(parents=True, exist_ok=True)
+            (root / "raw/train/results.csv").write_text(
+                "epoch,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)\n"
+                "1,0.1,0.2,0.3,0.4\n",
+                encoding="utf-8",
+            )
+            (root / "raw/train/weights/best.pt").write_bytes(b"b")
+            (root / "raw/train/weights/last.pt").write_bytes(b"l")
+            return DummyResults()
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=DummyYOLO))
+    runtime.execute_training_with_args(cfg, root, argparse.Namespace(execute=True, smoke=False))
+    assert Path(captured["project"]).is_absolute()

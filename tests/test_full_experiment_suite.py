@@ -248,6 +248,7 @@ def test_sequential_execution_and_no_concurrency(tmp_path: Path, monkeypatch: py
         active.clear()
 
     monkeypatch.setattr(suite, "execute_training_with_args", fake_execute)
+    monkeypatch.setattr(suite, "validate_completed_model_run", lambda *a, **k: [])
     monkeypatch.setattr(
         suite.argparse.ArgumentParser,
         "parse_args",
@@ -414,9 +415,41 @@ def test_resume_and_recovery_and_skip_completed(tmp_path: Path, monkeypatch: pyt
             print_report=False,
         ),
     )
-    with pytest.raises(ConfigError):
-        suite.main()
+    suite.main()
     assert recovered
+
+
+def test_effective_protocol_capture_and_audit():
+    summary = {
+        "effective_protocol": {
+            "optimizer": "MuSGD",
+            "lr0": 0.01,
+            "momentum": 0.937,
+            "augmentation": {
+                "RandAugment": "randaugment",
+                "erasing": 0.4,
+                "horizontal_flip": 0.5,
+                "translate": 0.1,
+                "scale": 0.5,
+            },
+        }
+    }
+    assert suite._effective_protocol_summary(summary) == summary["effective_protocol"]
+    diffs = suite._validate_effective_protocols(
+        [
+            summary,
+            {
+                "model_family": "yolov9",
+                "effective_protocol": {
+                    "optimizer": "SGD",
+                    "lr0": 0.01,
+                    "momentum": 0.937,
+                    "augmentation": summary["effective_protocol"]["augmentation"],
+                },
+            },
+        ]
+    )
+    assert diffs
 
 
 def test_invalid_completed_run_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

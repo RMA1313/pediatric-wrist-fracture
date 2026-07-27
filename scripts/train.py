@@ -29,6 +29,7 @@ from wrist_fracture.provenance import (
     sha256_file,
     to_jsonable,
 )
+from wrist_fracture.runtime import ExecutionOptions
 
 
 def _now() -> str:
@@ -448,7 +449,7 @@ def _write_run_summary(
     root: Path,
     *,
     cfg: ExperimentConfig,
-    args: argparse.Namespace,
+    options: ExecutionOptions,
     started_at: str,
     ended_at: str,
     duration_seconds: float,
@@ -456,6 +457,7 @@ def _write_run_summary(
     history_rows: list[dict[str, Any]],
     checkpoints: dict[str, Path | None],
     gpu_peak_memory_bytes: int | None,
+    effective_protocol: dict[str, Any] | None = None,
 ) -> None:
     metrics = _metrics_from_history(history_rows)
     payload = {
@@ -470,8 +472,9 @@ def _write_run_summary(
         },
         "ultralytics_save_dir": str(save_dir),
         "config": config_to_dict(cfg),
-        "execute": args.execute,
-        "smoke": args.smoke,
+        "execute": options.execute,
+        "smoke": options.smoke,
+        "effective_protocol": _normalize_json_value(effective_protocol),
         **metrics,
     }
     write_atomic(
@@ -516,7 +519,7 @@ def _execute_training_with_args(
         "weight_decay": cfg.weight_decay,
         "cache": cfg.hardware.cache,
         "save_period": cfg.run.save_period,
-        "project": str(root / "raw"),
+        "project": str((root / "raw").resolve()),
         "name": "train",
         "exist_ok": True,
         "pretrained": cfg.pretrained,
@@ -561,6 +564,21 @@ def _execute_training_with_args(
         actual_last = _maybe_copy_or_link(last_src, last_dst) if last_src else None
         if actual_best is None or actual_last is None:
             raise ConfigError("missing expected Ultralytics checkpoints")
+        trainer_args = getattr(getattr(results, "trainer", None), "args", None)
+        effective_protocol = {
+            "optimizer": getattr(trainer_args, "optimizer", None) or train_kwargs.get("optimizer"),
+            "lr0": getattr(trainer_args, "lr0", None) or train_kwargs.get("lr0"),
+            "momentum": getattr(trainer_args, "momentum", None),
+            "augmentation": {
+                "RandAugment": getattr(trainer_args, "auto_augment", None),
+                "erasing": getattr(trainer_args, "erasing", None) or train_kwargs.get("erasing"),
+                "horizontal_flip": getattr(trainer_args, "fliplr", None)
+                or train_kwargs.get("fliplr"),
+                "translate": getattr(trainer_args, "translate", None)
+                or train_kwargs.get("translate"),
+                "scale": getattr(trainer_args, "scale", None) or train_kwargs.get("scale"),
+            },
+        }
         gpu_peak_memory_bytes = None
         try:
             import torch
@@ -594,7 +612,7 @@ def _execute_training_with_args(
         _write_run_summary(
             root,
             cfg=cfg,
-            args=args,
+            options=ExecutionOptions(execute=args.execute, smoke=args.smoke),
             started_at=started_at,
             ended_at=ended_at,
             duration_seconds=duration_seconds,
@@ -602,6 +620,7 @@ def _execute_training_with_args(
             history_rows=history_rows,
             checkpoints={"best": actual_best, "last": actual_last},
             gpu_peak_memory_bytes=gpu_peak_memory_bytes,
+            effective_protocol=effective_protocol,
         )
         (root / "completed.marker").write_text(_now(), encoding="utf-8")
     except Exception:

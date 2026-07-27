@@ -63,6 +63,12 @@ _EXPECTED_SHARED_KEYS = [
     "save_period",
     "selection_metric",
 ]
+_EXPECTED_EFFECTIVE_KEYS = [
+    "optimizer",
+    "lr0",
+    "momentum",
+    "augmentation",
+]
 
 
 def _atomic_write(path: Path, payload: Any) -> None:
@@ -350,6 +356,7 @@ def summarize_model_run(
         "resume_count": run_summary.get("resume_count", 0),
         "recovery_used": recovery_used,
         "error_summary": error,
+        "effective_protocol": run_summary.get("effective_protocol"),
         **_run_signature(cfg),
     }
 
@@ -383,8 +390,44 @@ def _suite_summary_rows(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]
         "resume_count",
         "recovery_used",
         "error_summary",
+        "effective_protocol",
     ]
     return [{key: summary.get(key) for key in keys} for summary in summaries]
+
+
+def _effective_protocol_summary(summary: dict[str, Any]) -> dict[str, Any] | None:
+    protocol = summary.get("effective_protocol")
+    if not isinstance(protocol, dict):
+        return None
+    return {
+        "optimizer": protocol.get("optimizer"),
+        "lr0": protocol.get("lr0"),
+        "momentum": protocol.get("momentum"),
+        "augmentation": protocol.get("augmentation"),
+    }
+
+
+def _validate_effective_protocols(summaries: list[dict[str, Any]]) -> list[str]:
+    if not summaries:
+        return []
+    protocols = [_effective_protocol_summary(summary) for summary in summaries]
+    present = [protocol for protocol in protocols if protocol is not None]
+    if not present:
+        return []
+    base = present[0]
+    diffs: list[str] = []
+    for summary, other in zip(summaries[1:], protocols[1:], strict=False):
+        if other is None:
+            diffs.append(f"{summary.get('model_family')}: missing effective protocol")
+            continue
+        for key in _EXPECTED_EFFECTIVE_KEYS:
+            if json.dumps(base.get(key), sort_keys=True, default=str) != json.dumps(
+                other.get(key), sort_keys=True, default=str
+            ):
+                diffs.append(
+                    f"{summary.get('model_family')}.{key}: {base.get(key)!r} != {other.get(key)!r}"
+                )
+    return diffs
 
 
 def _write_suite_report(
@@ -596,6 +639,10 @@ def run_suite(args: argparse.Namespace) -> int:
                 if (run_dir / "raw").exists() and args.recover:
                     recover_training_artifacts(run_dir)
                     recovery_used = True
+                    validation_errors = validate_completed_model_run(run_dir, cfg)
+                    error = None
+                    if validation_errors and not args.continue_on_error:
+                        raise ConfigError("; ".join(validation_errors)) from None
                 elif not args.continue_on_error:
                     raise
             if error is None and (run_dir / "completed.marker").exists():
@@ -604,6 +651,7 @@ def run_suite(args: argparse.Namespace) -> int:
                     recover_training_artifacts(run_dir)
                     recovery_used = True
                     validation_errors = validate_completed_model_run(run_dir, cfg)
+                    error = None
                 if validation_errors:
                     error = "; ".join(validation_errors)
             if error:
@@ -620,6 +668,7 @@ def run_suite(args: argparse.Namespace) -> int:
                 summarize_model_run(cfg, run_dir, status="completed", recovery_used=recovery_used)
             )
         diffs = validate_full_protocol_configs(configs)
+        diffs.extend(_validate_effective_protocols(summaries))
         if diffs:
             raise ConfigError("; ".join(diffs))
         _write_suite_report(suite_dir, summaries, diffs)
