@@ -22,7 +22,8 @@ outputs/*
 !outputs/experiments/.gitkeep
 !outputs/figures/.gitkeep
 !outputs/tables/.gitkeep
-
+demo/frontend/.next/
+demo/frontend/node_modules/
 *.pt
 *.pth
 *.onnx

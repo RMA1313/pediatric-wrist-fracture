@@ -1,6 +1,7 @@
 PYTHON ?= python
 
 .PHONY: setup audit test lint format \
+	demo-backend demo-frontend demo-test demo-check \
 	experiment-check experiment-validate \
 	train-dry-run-yolov8n train-dry-run-yolov9t train-dry-run-yolo26n \
 	smoke-suite-dry-run smoke-suite \
@@ -25,6 +26,18 @@ lint:
 
 format:
 	uv run ruff format .
+
+demo-backend:
+	uv run uvicorn demo.backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+
+demo-frontend:
+	cd demo/frontend && npm install && npm run dev
+
+demo-test:
+	uv run pytest -q
+
+demo-check:
+	uv run ruff check . && uv run ruff format --check . && cd demo/frontend && npm install && npm run lint && npm run typecheck && npm run build
 
 experiment-check:
 	uv run python scripts/train.py --config configs/experiment.yaml --dry-run

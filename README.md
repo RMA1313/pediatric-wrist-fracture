@@ -152,6 +152,16 @@ It is **not** a medical device and must not be used for clinical diagnosis.
 
 Any medical deployment requires regulatory approval and prospective clinical validation.
 
+## RTL Inference Demo
+
+The repository now includes a separate Persian RTL demo under `demo/` for inference-only use with the trained `best.pt` checkpoints.
+
+- Frontend: `demo/frontend`
+- Backend: `demo/backend`
+- Demo README: [demo/README.md](demo/README.md)
+
+The demo is isolated from training, evaluation, calibration, and reporting code paths.
+
 ## Citation
 
 ```bibtex
