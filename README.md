@@ -1,61 +1,168 @@
-# Detection and Localization of Pediatric Wrist Fractures in Radiographs Using YOLO26
+# Pediatric Wrist Fracture Detection & Localization
 
-This repository contains the research infrastructure for a bachelor’s thesis on single-class wrist fracture detection in pediatric radiographs.
+> A reproducible research infrastructure for benchmarking modern YOLO architectures on pediatric wrist fracture detection and localization from radiographs.
 
-## Status
+## Overview
 
-- Phase 2 dataset preparation is complete.
-- Phase 3 infrastructure is being finalized.
-- Real validation and benchmark execution are supported for the completed smoke checkpoints, but the repository still treats those results as pipeline verification rather than final science.
+This repository accompanies a bachelor's research project in Computer Engineering focused on object detection for pediatric wrist fractures. Rather than implementing a single training script, the project provides a complete experiment pipeline including dataset preparation, experiment configuration, model training, benchmarking, evaluation, visualization and reproducibility utilities.
 
-## Core controls
+The primary research model is **YOLO26**, while **YOLOv8** and **YOLOv9** are included as controlled baselines for fair comparison.
 
-- Dataset: GRAZPEDWRI-DX derived YOLO dataset under `data/processed/yolo/`
-- Splits: immutable patient-level train/val/test splits
-- Primary models: YOLOv8n, YOLOv9t, YOLO26n
-- Default image size: 640
-- Seed: 42
-- Validation metric: `metrics/mAP50-95(B)`
-- Smoke-suite dry-run: `uv run python scripts/run_smoke_suite.py --dry-run`
-- Smoke-suite execute: `uv run python scripts/run_smoke_suite.py --execute`
-- Full-suite dry-run: `uv run python scripts/run_full_experiment_suite.py --dry-run`
-- Full-suite execute: `uv run python scripts/run_full_experiment_suite.py --execute`
-- Validation/benchmark suite dry-run: `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --dry-run`
-- Validation/benchmark suite execute: `uv run python scripts/run_validation_benchmark_suite.py --source-suite <path> --execute`
-- Smoke metrics are pipeline checks only and are not scientific results.
+## Highlights
 
-## Safe commands
+- Reproducible experiment pipeline
+- Configuration-driven workflow
+- Support for YOLOv8, YOLOv9 and YOLO26
+- Smoke and full experiment profiles
+- GPU preflight validation
+- Dataset inspection and validation
+- Benchmark generation
+- Evaluation utilities
+- Publication-ready outputs
 
-- `make experiment-validate`
-- `make train-dry-run-yolov8n`
-- `make train-dry-run-yolov9t`
-- `make train-dry-run-yolo26n`
-- `make smoke-suite-dry-run`
-- `make smoke-suite`
-- `make full-suite-dry-run`
-- `make full-suite`
-- `make gpu-preflight`
-- `make transfer-manifest`
-- `make transfer-verify`
-- `make evaluate-dry-run`
-- `make benchmark-dry-run`
-- `make validation-benchmark-dry-run SOURCE_SUITE=<path>`
-- `make validation-benchmark-suite SOURCE_SUITE=<path>`
-- `make test`
-- `make lint`
-- `make format`
+## Repository Architecture
 
-## Documentation
+```text
+configs/
+    dataset/
+    hardware/
+    models/
+    runs/
 
-- [Experiment protocol](docs/experiment_protocol.md)
-- [Decisions](docs/decisions.md)
-- [References](docs/references.md)
-- [RTX 4090 setup](docs/rtx4090_setup.md)
+data/
+docs/
+outputs/
+scripts/
+tests/
+```
 
-## Safety
+## Research Workflow
 
-- Full training requires explicit `--execute`.
-- CPU execution is limited to development smoke paths.
-- Test-set evaluation requires `--allow-test`.
-- Model checkpoints are required explicitly for evaluation and benchmarking.
-- Phase 5 full training requires validated calibration evidence and the frozen `configs/runs/full.yaml` protocol before execution.
+```mermaid
+flowchart LR
+A[Dataset] --> B[Validation]
+B --> C[Preprocessing]
+C --> D[Training]
+D --> E[Evaluation]
+E --> F[Benchmark]
+F --> G[Analysis]
+G --> H[Figures & Thesis]
+```
+
+## Experiment Pipeline
+
+```mermaid
+flowchart TB
+Dataset --> YOLOv8
+Dataset --> YOLOv9
+Dataset --> YOLO26
+
+YOLOv8 --> Metrics
+YOLOv9 --> Metrics
+YOLO26 --> Metrics
+
+Metrics --> Comparison
+Comparison --> FinalReport
+```
+
+## Installation
+
+```bash
+git clone https://github.com/RMA1313/pediatric-wrist-fracture.git
+cd pediatric-wrist-fracture
+
+uv sync
+```
+
+## Project Structure
+
+| Directory | Purpose |
+|-----------|---------|
+| configs | Experiment configuration |
+| data | Dataset location |
+| docs | Research documentation |
+| outputs | Generated artifacts |
+| scripts | Dataset, training and evaluation utilities |
+| tests | Validation tests |
+
+## Configuration
+
+Experiments are controlled through YAML files.
+
+- configs/project.yaml
+- configs/dataset.yaml
+- configs/experiment.yaml
+- configs/models/
+- configs/hardware/
+- configs/runs/
+
+No source-code modification is required to switch models or hardware profiles.
+
+## Supported Models
+
+| Model | Role |
+|------|------|
+| YOLOv8 | Baseline |
+| YOLOv9 | Comparative baseline |
+| YOLO26 | Primary research model |
+
+## Typical Workflow
+
+```mermaid
+flowchart LR
+
+Clone --> Configure
+Configure --> DownloadDataset
+DownloadDataset --> Validate
+Validate --> Train
+Train --> Evaluate
+Evaluate --> Benchmark
+Benchmark --> Analyze
+```
+
+## Scripts
+
+The repository contains utilities for:
+
+- dataset acquisition
+- dataset inspection
+- dataset validation
+- GPU validation
+- benchmarking
+- evaluation
+- training
+- environment auditing
+
+## Reproducibility
+
+The project was designed around reproducible research principles:
+
+- configuration-first design
+- deterministic execution
+- patient-level dataset split
+- fixed experiment protocol
+- benchmark reproducibility
+- experiment documentation
+
+## Research Scope
+
+This repository is intended for research purposes.
+
+It is **not** a medical device and must not be used for clinical diagnosis.
+
+Any medical deployment requires regulatory approval and prospective clinical validation.
+
+## Citation
+
+```bibtex
+@misc{seddiqmirzaei2026,
+  title={Pediatric Wrist Fracture Detection and Localization},
+  author={Mohammad Erfan Seddiq Mirzaei},
+  year={2026},
+  note={Bachelor Thesis, Amirkabir University of Technology}
+}
+```
+
+## License
+
+See LICENSE.
